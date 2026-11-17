@@ -1,0 +1,19 @@
+[package]
+name = "libvz-ffi"
+version = "1.0.0"
+edition = "2024"
+description = "C and C++ ABI bindings (with cbindgen header generation) for libvz"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "vz"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+libvz = { path = "../libvz", features = ["std", "compression", "hashes", "crypto", "mmap"] }
+
+[build-dependencies]
+cbindgen = "0.29"
+
+[dev-dependencies]
+tempfile = "3.27"

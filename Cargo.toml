@@ -1,0 +1,4 @@
+[workspace]
+resolver = "2"
+members = ["crates/libvz", "crates/libvz-ffi", "crates/vz-tools", "crates/vz-bench"]
+default-members = ["crates/libvz", "crates/libvz-ffi", "crates/vz-tools"]

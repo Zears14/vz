@@ -1,0 +1,58 @@
+[package]
+name = "libvz"
+version = "1.0.0"
+edition = "2024"
+description = "libvz: VZ v1.0 fixed-struct + LE-TLV B+Tree container library (high-level API + low-level wire primitives)"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["std"]
+std = []
+compression = ["std", "dep:lz4_flex", "dep:zstd"]
+hashes = ["dep:blake3", "dep:xxhash-rust"]
+crypto = [
+    "std",
+    "dep:chacha20poly1305",
+    "dep:argon2",
+    "dep:hkdf",
+    "dep:sha2",
+    "dep:rand_core",
+]
+mmap = ["std", "dep:memmap2"]
+cli = ["std", "compression", "hashes", "crypto", "mmap", "dep:clap"]
+
+[dependencies]
+# Compression
+lz4_flex = { version = "0.14", optional = true }
+zstd = { version = "0.13", optional = true }
+
+# Hashes (no_std compatible)
+blake3 = { version = "1.8", default-features = false, optional = true }
+xxhash-rust = { version = "0.8", features = ["xxh3"], optional = true }
+
+# Authenticated Encryption
+chacha20poly1305 = { version = "0.10", optional = true }
+argon2 = { version = "0.5", optional = true }
+hkdf = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+rand_core = { version = "0.6", features = ["getrandom"], optional = true }
+
+# Memory-mapped I/O
+memmap2 = { version = "0.9", optional = true }
+
+# CLI support
+clap = { version = "4.6", features = ["derive"], optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1.12"
+tempfile = "3.27"
+
+[[bench]]
+name = "vz_benchmarks"
+harness = false
+required-features = ["std", "compression", "hashes", "crypto", "mmap"]
+
+[[example]]
+name = "metrics_runner"
+required-features = ["std", "compression", "hashes", "crypto", "mmap"]

@@ -1,0 +1,19 @@
+language = "C"
+cpp_compat = true
+include_guard = "VZ_H"
+sys_includes = ["stdbool.h", "stddef.h", "stdint.h"]
+no_includes = true
+documentation = true
+documentation_style = "c99"
+line_length = 100
+tab_width = 4
+style = "both"
+
+[enum]
+rename_variants = "None"
+
+[export]
+include = [
+    "VZ_ABI_VERSION",
+    "VZ_FUSE_ROOT_ID",
+]

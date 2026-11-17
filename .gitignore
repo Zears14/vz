@@ -1,0 +1,6 @@
+/target/
+*.vz
+*.tmp
+*.swp
+*~
+.DS_Store

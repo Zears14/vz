@@ -151,7 +151,7 @@ impl<W: Write> ClusterEmitter<W> {
     }
 
     /// Appends a 64-byte-aligned `TAG_DATA_MANIFEST` TLV to `body`, returning `in_cluster_offset`.
-    fn append_manifest_tlv_to_body(
+    pub(super) fn append_manifest_tlv_to_body(
         body: &mut Vec<u8>,
         cluster_off: u64,
         entry_id: u64,

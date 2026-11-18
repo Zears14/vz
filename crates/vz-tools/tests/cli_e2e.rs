@@ -204,4 +204,36 @@ fn test_cli_pack_verify_corrupt_repair_unpack_and_append_compact() {
         .output()
         .unwrap();
     assert!(!cat_deleted.status.success());
+
+    // 5. In-place compaction directly on the appended `arc` file (no output path, O(batch) RAM/disk)
+    let cmp_ip = Command::new(vz_bin())
+        .args([
+            "compact",
+            "--in-place",
+            "--batch-mib",
+            "1",
+            arc.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        cmp_ip.status.success(),
+        "compact --in-place failed: {}",
+        String::from_utf8_lossy(&cmp_ip.stderr)
+    );
+    let ip_txt = String::from_utf8_lossy(&cmp_ip.stdout);
+    assert!(ip_txt.contains("compacted in-place (fresh): lsm_runs 2 -> 1"));
+
+    let ver_ip = Command::new(vz_bin())
+        .args(["verify", arc.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(ver_ip.status.success());
+
+    let cat_ip = Command::new(vz_bin())
+        .args(["cat", arc.to_str().unwrap(), "/extra.txt"])
+        .output()
+        .unwrap();
+    assert!(cat_ip.status.success());
+    assert_eq!(cat_ip.stdout, b"appended content");
 }

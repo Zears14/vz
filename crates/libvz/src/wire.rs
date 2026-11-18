@@ -65,6 +65,9 @@ pub const RO_COMPAT_LSM_RUNS: u16 = 1 << 1;
 pub const INCOMPAT_ENCRYPTED: u16 = 1 << 0;
 /// Archive uses an extended Boot Block larger than 64 KiB (`boot_block_size > 65536`).
 pub const INCOMPAT_BIG_BOOT: u16 = 1 << 1;
+/// Archive is mid-flight during an in-place compaction (`BootHeader::root_fallback_off` points to the `VZ_CMPJ` journal).
+/// Normal readers MUST abort with [`VzError::IncompatibleFeature`] until compaction completes or resumes.
+pub const INCOMPAT_COMPACTING: u16 = 1 << 2;
 
 // --- LE-TLV Element Tag IDs (Decoded values after `>> 2`) ---
 

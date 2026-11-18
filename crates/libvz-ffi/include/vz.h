@@ -420,6 +420,14 @@ VzStatus vz_verify_file(const char *path,
 // Repairs single-page Boot ECC and `<= M` RS-corrupted clusters at `path` in-place.
 VzStatus vz_repair_file(const char *path, struct VzRepairReportC *out);
 
+// Compacts (or resumes an interrupted compaction of) `path` in-place using bounded RAM (`batch_bytes`,
+// defaulting to `4 MiB` when `0`) and zero `2x` disk duplication.
+VzStatus vz_archive_compact_in_place(const char *path,
+                                     const struct VzOpenOptions *open_opts,
+                                     const struct VzCompactOptionsC *compact_opts,
+                                     uintptr_t batch_bytes,
+                                     uint64_t *out_compacted_bytes);
+
 // Mounts an opened [`VzArchive`] into an in-memory `O(1)`/`O(log N)` FUSE3 volume.
 VzStatus vz_fuse_mount(const struct VzArchive *arc, struct VzFuseVol **out);
 

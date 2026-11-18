@@ -142,6 +142,8 @@ pub use fuse::{
 };
 #[cfg(feature = "std")]
 pub use writer::{
-    CompactOptions, EntryOptions, LsmAppendWriter, PipeFinalizeInfo, VzPipeWriter, VzStreamedFile,
-    VzWriter, VzWriterConfig, compact_archive, compact_archive_with_options, finalize_pipe_archive,
+    CompactOptions, EntryOptions, InPlaceCompactOptions, InPlaceCompactReport,
+    InPlaceCrashPoint, LsmAppendWriter, PipeFinalizeInfo, VzPipeWriter, VzStreamedFile, VzWriter,
+    VzWriterConfig, compact_archive, compact_archive_with_options, compact_file_in_place,
+    compact_file_in_place_with_hook, finalize_pipe_archive, resume_in_place_compaction,
 };

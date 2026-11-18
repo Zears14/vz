@@ -7,10 +7,10 @@ use std::time::UNIX_EPOCH;
 use clap::{Parser, Subcommand};
 use libvz::cli_support::{CliCodec, CliHashAlgo};
 use libvz::{
-    CompactOptions, EncryptionKey, EntryOptions, KIND_DIR, KIND_LNK, KIND_REG, LsmAppendWriter,
-    MmapRangeReader, OwnerEntry, VzError, VzPipeWriter, VzReader, VzReaderOptions, VzWriter,
-    VzWriterConfig, compact_archive_with_options, finalize_pipe_archive, repair_file,
-    scan_clusters_forward, verify_archive,
+    CompactOptions, EncryptionKey, EntryOptions, InPlaceCompactOptions, KIND_DIR, KIND_LNK,
+    KIND_REG, LsmAppendWriter, MmapRangeReader, OwnerEntry, VzError, VzPipeWriter, VzReader,
+    VzReaderOptions, VzWriter, VzWriterConfig, compact_archive_with_options, compact_file_in_place,
+    finalize_pipe_archive, repair_file, scan_clusters_forward, verify_archive,
 };
 
 #[derive(Parser)]
@@ -120,10 +120,16 @@ enum Commands {
         #[arg(long)]
         key_hex: Option<String>,
     },
-    /// Compact a multi-run LSM archive into a fresh single-run .vz archive (zero re-encoding by default)
+    /// Compact a multi-run LSM archive into a single-run .vz archive (zero re-encoding by default)
     Compact {
         input: PathBuf,
-        output: PathBuf,
+        output: Option<PathBuf>,
+        /// Compact directly in-place using crash-safe EOF bounce journaling (`O(batch)` RAM/disk)
+        #[arg(long)]
+        in_place: bool,
+        /// Bounded RAM & bounce batch window size in MiB for `--in-place` (default 4)
+        #[arg(long, default_value_t = 4)]
+        batch_mib: usize,
         /// Optional codec override (forces re-encoding instead of zero-reencode compaction)
         #[arg(long, value_enum)]
         codec: Option<CliCodec>,
@@ -799,6 +805,8 @@ fn run() -> Result<(), String> {
         Commands::Compact {
             input,
             output,
+            in_place,
+            batch_mib,
             codec,
             password,
             key_hex,
@@ -806,6 +814,40 @@ fn run() -> Result<(), String> {
         } => {
             let encryption = parse_encryption(password.clone(), key_hex.clone())?;
             let rs_parity = parse_rs(rs)?;
+            if in_place {
+                if output.is_some() {
+                    return Err("--in-place takes no <OUTPUT> path".into());
+                }
+                if codec.is_some() {
+                    return Err("--codec re-encoding cannot be combined with --in-place".into());
+                }
+                let mut f = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&input)
+                    .map_err(|e| format!("open {} for in-place compact: {e}", input.display()))?;
+                let rep = compact_file_in_place(
+                    &mut f,
+                    InPlaceCompactOptions {
+                        rs_parity,
+                        encryption,
+                        batch_bytes: batch_mib.max(1).saturating_mul(1024 * 1024),
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| format!("compact --in-place: {e}"))?;
+                println!(
+                    "compacted in-place ({}): lsm_runs {} -> 1, {} -> {} bytes, batches={}, evacuated={} bytes",
+                    if rep.resumed { "resumed" } else { "fresh" },
+                    rep.prev_lsm_runs,
+                    rep.original_bytes,
+                    rep.compacted_bytes,
+                    rep.batches_written,
+                    rep.evacuated_bytes
+                );
+                return Ok(());
+            }
+            let output = output.ok_or_else(|| "missing <OUTPUT> path (or pass --in-place)".to_string())?;
             let in_f = File::open(&input).map_err(|e| format!("open input: {e}"))?;
             let reader = VzReader::open_with_options(
                 in_f,

@@ -567,6 +567,16 @@ public:
         return rep;
     }
 
+    static uint64_t compact_in_place(const std::string& path,
+                                     const VzOpenOptions& open_opts = vz_open_options_default(),
+                                     const VzCompactOptionsC& compact_opts = vz_compact_options_default(),
+                                     size_t batch_bytes = 0) {
+        uint64_t compacted_bytes = 0;
+        detail::check(vz_archive_compact_in_place(
+            path.c_str(), &open_opts, &compact_opts, batch_bytes, &compacted_bytes));
+        return compacted_bytes;
+    }
+
     ~Archive() noexcept { close(); }
     Archive(const Archive&) = delete;
     Archive& operator=(const Archive&) = delete;

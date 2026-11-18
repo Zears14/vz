@@ -1,10 +1,15 @@
 mod btree_build;
 mod compact;
 mod emitter;
+mod inplace_compact;
 mod lsm_append;
 mod pipe;
 
 pub use compact::{CompactOptions, compact_archive, compact_archive_with_options};
+pub use inplace_compact::{
+    InPlaceCompactOptions, InPlaceCompactReport, InPlaceCrashPoint, compact_file_in_place,
+    compact_file_in_place_with_hook, resume_in_place_compaction,
+};
 pub use lsm_append::LsmAppendWriter;
 pub use pipe::{PipeFinalizeInfo, VzPipeWriter, finalize_pipe_archive};
 

@@ -7,8 +7,9 @@ use std::slice;
 use std::sync::Arc;
 
 use libvz::{
-    CompactOptions, KIND_DIR, KIND_MASK, MmapRangeReader, VzError, VzReader, VzReaderOptions,
-    compact_archive_with_options, repair_file, verify_archive,
+    CompactOptions, InPlaceCompactOptions, KIND_DIR, KIND_MASK, MmapRangeReader, VzError,
+    VzReader, VzReaderOptions, compact_archive_with_options, compact_file_in_place, repair_file,
+    verify_archive,
 };
 
 use crate::types::*;
@@ -605,6 +606,62 @@ pub unsafe extern "C" fn vz_repair_file(
                         parity_clusters_repaired: rep.parity_clusters_repaired,
                     };
                 }
+            }
+            VzStatus::VZ_OK
+        }
+        Err(e) => fail_vz(e),
+    }
+}
+
+/// Compacts (or resumes an interrupted compaction of) `path` in-place using bounded RAM (`batch_bytes`,
+/// defaulting to `4 MiB` when `0`) and zero `2x` disk duplication.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vz_archive_compact_in_place(
+    path: *const c_char,
+    open_opts: *const VzOpenOptions,
+    compact_opts: *const VzCompactOptionsC,
+    batch_bytes: usize,
+    out_compacted_bytes: *mut u64,
+) -> VzStatus {
+    clear_last_error();
+    let path_str = match unsafe { read_c_str(path) } {
+        Ok(s) => s,
+        Err(st) => return st,
+    };
+    let o = if open_opts.is_null() {
+        vz_open_options_default()
+    } else {
+        unsafe { *open_opts }
+    };
+    let key = match unsafe { parse_key(o.encryption_mode, &o.raw_key, o.passphrase) } {
+        Ok(k) => k,
+        Err(st) => return st,
+    };
+    let mut copts = InPlaceCompactOptions {
+        encryption: key,
+        ..Default::default()
+    };
+    if batch_bytes > 0 {
+        copts.batch_bytes = batch_bytes;
+    }
+    if !compact_opts.is_null() {
+        let c = unsafe { *compact_opts };
+        copts.enable_boot_ecc = Some(c.enable_boot_ecc);
+        if c.target_cluster_size > 0 {
+            copts.target_cluster_size = Some(c.target_cluster_size);
+        }
+        if c.rs_parity_k > 0 && c.rs_parity_m > 0 {
+            copts.rs_parity = Some((c.rs_parity_k, c.rs_parity_m));
+        }
+    }
+    let mut f = match OpenOptions::new().read(true).write(true).open(path_str) {
+        Ok(file) => file,
+        Err(e) => return fail(VzStatus::VZ_ERR_IO, &e.to_string()),
+    };
+    match compact_file_in_place(&mut f, copts) {
+        Ok(rep) => {
+            if !out_compacted_bytes.is_null() {
+                unsafe { *out_compacted_bytes = rep.compacted_bytes };
             }
             VzStatus::VZ_OK
         }

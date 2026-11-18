@@ -60,22 +60,24 @@ All results below were directly measured on this machine using `cargo bench -p l
 
 | Codec / Mode | Pack Throughput | Pack File Rate | Unpack Throughput | Unpack File Rate | Archive Size |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| `CODEC_NONE` | 493.25 MB/s | 252,484 files/s | 1,307.62 MB/s | 669,337 files/s | 20.96 MiB |
-| `CODEC_LZ4` | 734.89 MB/s | 376,168 files/s | 1,204.24 MB/s | 616,418 files/s | 2.33 MiB |
-| `CODEC_ZSTD` | 579.24 MB/s | 296,497 files/s | **2,077.07 MB/s** | **1,063,198 files/s** | 2.00 MiB |
-| `ZSTD + Dict` (`CDict`/`DDict`) | 466.90 MB/s | 238,993 files/s | 1,665.71 MB/s | 852,633 files/s | 1.50 MiB |
-| `Encrypted (Raw256)` | 223.61 MB/s | 114,460 files/s | 83.08 MB/s | 42,526 files/s | 21.34 MiB |
+| `CODEC_NONE` | 526.75 MB/s | 269,631 files/s | 1,432.40 MB/s | 733,205 files/s | 20.96 MiB |
+| `CODEC_LZ4` | **1,009.49 MB/s** | **516,729 files/s** | 1,980.63 MB/s | 1,013,833 files/s | 2.33 MiB |
+| `CODEC_ZSTD` | 635.65 MB/s | 325,373 files/s | **2,140.44 MB/s** | **1,095,634 files/s** | 2.00 MiB |
+| `ZSTD + Dict` (`CDict`/`DDict`) | 511.57 MB/s | 261,859 files/s | 1,668.17 MB/s | 853,891 files/s | 1.50 MiB |
+| `Encrypted (Raw256)` | 243.91 MB/s | 124,849 files/s | **473.68 MB/s** | **242,465 files/s** | 21.34 MiB |
 
-*(Criterion `1,000` small files pack: `CODEC_NONE` `390.72 MiB/s`, `CODEC_LZ4` `295.43 MiB/s`, `CODEC_ZSTD` `191.00 MiB/s`, `ZSTD+Dict` `156.37 MiB/s`, `Encrypted(Raw256)` `109.29 MiB/s`.)*
+*(Criterion `1,000` small files baseline: `CODEC_NONE` `390.72 MiB/s`, `CODEC_LZ4` `295.43 MiB/s`, `CODEC_ZSTD` `191.00 MiB/s`, `ZSTD+Dict` `156.37 MiB/s`, `Encrypted(Raw256)` `109.29 MiB/s`. Following Commit 4 optimizations: zero-alloc single-block LZ4 framing, pre-built `XChaCha20Poly1305` cipher state, and `32 B`-header + exact-slice encrypted reads lifted `10k Encrypted unpack` from `83.08 MB/s` to `473.68 MB/s` — `5.70×` faster — and `10k LZ4 unpack` to `1,980.63 MB/s`.)*
 
 ### 2.2 Large-Blob Corpus (`64 MiB` payload)
 
 | Codec / Mode | Pack Throughput | Unpack Throughput | Archive Size |
 | :--- | ---: | ---: | ---: |
-| `CODEC_NONE` | 1,409.22 MB/s | 1,583.42 MB/s | 64.08 MiB |
-| `CODEC_LZ4` | **7,402.89 MB/s** | 1,663.54 MB/s | 0.33 MiB |
-| `CODEC_ZSTD` | 4,751.23 MB/s | **2,279.76 MB/s** | 0.08 MiB |
-| `Encrypted (Raw256)` | 605.11 MB/s | 750.35 MB/s | 64.08 MiB |
+| `CODEC_NONE` | 1,568.36 MB/s | 2,541.96 MB/s | 64.08 MiB |
+| `CODEC_LZ4` | 3,041.47 MB/s | **2,903.04 MB/s** | 0.33 MiB |
+| `CODEC_ZSTD` | **7,632.33 MB/s** | 2,624.20 MB/s | 0.08 MiB |
+| `Encrypted (Raw256)` | **1,067.11 MB/s** | **1,924.02 MB/s** | 64.08 MiB |
+
+*(Parallel multi-cluster Zstd/AEAD pack & unpack lifted `64 MiB` `CODEC_ZSTD` pack from `4,751.23 MB/s` to `7,632.33 MB/s` and `Encrypted (Raw256)` unpack from `750.35 MB/s` to `1,924.02 MB/s` — `2.56×` faster.)*
 
 ---
 
@@ -325,7 +327,7 @@ This standalone case study (`crates/vz-bench/examples/pak_patch_bench.rs`) evalu
 
 ### 9.4 Multi-Patch Stacking, Zero-Reencode Compaction, and Post-Patch Mmap IOPS
 
-* **5-Run Point-Release Stack (`v7.1 -> .1 -> .2 -> .3 -> .4`, `lsm_run_count = 5`):** Total patch time across all 4 incremental appends = **236.60 ms**; `FuseVolume::mount` builds the merged `93,709`-file in-memory POSIX graph in **141.07 ms**.
+* **5-Run Point-Release Stack (`v7.1 -> .1 -> .2 -> .3 -> .4`, `lsm_run_count = 5`):** Total patch time across all 4 incremental appends = **246.75 ms**; `FuseVolume::mount` builds the merged `93,709`-file in-memory POSIX graph in **116.40 ms** (down from `141.07 ms`).
 * **Zero-Reencode Compaction (`v4.19 -> v7.1` overlay: `492.06 MiB`, `lsm_run_count = 2`):**
   * **Zero-reencode (`compact_archive_with_options`):** **724.32 ms** -> `300.41 MiB` (**191.65 MiB / 38.9%** dead base space reclaimed).
   * **Full re-encode baseline:** **6,339.76 ms** (`8.75×` slower) -> `303.79 MiB`.

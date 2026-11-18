@@ -95,6 +95,7 @@ A `.vz` archive consists of a fixed-size **Boot Block** (`[0 .. boot_block_size)
 - `incompat_flags`:
   - `INCOMPAT_ENCRYPTED = 1 << 0`: Payloads are encrypted using `TAG_CIPHER_HEADER`.
   - `INCOMPAT_BIG_BOOT = 1 << 1`: `boot_block_size > 65,536`.
+  - `INCOMPAT_COMPACTING = 1 << 2`: Crash-safe in-place compaction journal (`VZCMPJ01`) is active at `HeaderSlot.root_fallback_off`; normal readers MUST fail closed with `IncompatibleFeature` until compaction completes or resumes.
 
 ---
 
@@ -169,7 +170,16 @@ Every TLV element has the form `[Tag: LE-VINT][Length: LE-VINT][Value: Length by
 | `0x15` | `0x54` | `TAG_INODE_HI` | `ExtMetaPool`: upper 32 bits of 64-bit inode (`FLAG_INODE_64`) |
 | `0x16` | `0x58` | `TAG_EXT_CODEC` | `ExtMetaPool`: extended codec / Zstd dictionary ID link |
 | `0x17` | `0x5C` | `TAG_SCHEMA_LINK` | `ExtMetaPool`: links `KIND_TENSOR`/`KIND_COLUMN` entry to `schema_id` |
+| `0x3A` | `0xE8` | `TAG_VENDOR_EXT` | Self-identifying reverse-DNS vendor extension envelope |
 | `0x3B` | `0xEC` | `TAG_VOID` | Context-free void padding TLV |
+
+### 5.4 TLV Tag Allocation Governance & Downstream Anti-Collision
+- **`0x0000 ..= 0x0FFF` (`TLV_CORE_MAX`):** Reserved exclusively for upstream VZ core standards (`is_downstream_allocatable_tag` returns `false` inside this range except `TAG_VENDOR_EXT`). Downstream forks MUST NOT allocate tags here.
+- **`0x1000 ..= 0x3BFF` (`TLV_REGISTERED_MIN..=MAX`):** Shared ecosystem extensions (`2`-byte LE-VINT).
+- **`0x3C00 ..= 0x3FFF` (`TLV_PRIVATE_MIN..=MAX`):** Closed Private Use (`2`-byte LE-VINT).
+- **`0x1000_0000 ..` (`TLV_PEN_BASE`):** Deterministic 4-byte LE-VINT vendor IANA PEN tags via `vendor_pen_tag(pen, sub_tag) = 0x1000_0000 | ((pen & 0xF_FFFF) << 8) | sub_tag`.
+- **`TAG_VENDOR_EXT` (`0x3A`, wire `0xE8`):** Portable reverse-DNS extension wrapper `ns_len (LE-VINT) || ns_utf8 || sub_tag (LE-VINT) || payload_bytes`.
+- Writers performing LSM appends or compaction MUST preserve unknown Registry (`extra_registry_tlvs`) and `ExtMetaPool` (`extra_ext_tlvs`) TLVs across runs. Features that alter mandatory parsing or integrity MUST NOT rely on ignorable TLVs alone and MUST assert an `incompat_flags` or `ro_compat_flags` bit.
 
 ---
 
@@ -408,6 +418,7 @@ Each chunk occupies its own cluster (unique `cluster_seq`) so AEAD AAD `(generat
   - Otherwise return the entry, using that run's `run_generation` for AEAD decryption.
 - **`readdir(dir)`:** Collect entries across all runs from newest to oldest, deduplicating by exact `(parent_path, basename)` (newest wins; if newest is `FLAG_TOMBSTONE`, suppress the path).
 - **Compaction (`compact`):** Materializes the merged live entry set into a fresh single-run (`lsm_run_count = 1`) archive, reclaiming overwritten payloads and tombstoned entries.
+- **In-Place Crash-Safe Compaction (`INCOMPAT_COMPACTING`):** `compact_file_in_place` / `resume_in_place_compaction` stage an EOF journal (`VZCMPJ01`, ping-pong CRC checkpoints, `VZPLAN01`, `BounceSlot`, and overlap evacuation `VZEVAC01`) anchored by `HeaderSlot.root_fallback_off`, copy live data in bounded `O(batch_bytes)` RAM/disk windows in ascending physical offset order, atomically commit the final single-run Boot Block, and truncate to `final_len`.
 
 ---
 

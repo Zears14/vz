@@ -36,7 +36,7 @@ All numbers below are measured on an AMD Ryzen 5 5600H (Linux `x86_64`, default 
 * **Small-File Inlining & Smart Chunking:** Payloads `<= 27 B` inline directly inside directory entries (`data_clusters = 0` possible); large blobs automatically split into multi-cluster chunks with a `TAG_CHUNK_TABLE` seek table for `O(1)` sub-range reads (`read_file_range` / `read_file_range_into`).
 * **Sparse Files, POSIX Metadata & Schema/Dictionary Registries:** Built-in sparse extent maps (zero-I/O hole reads), symlinks, hardlinks (`nlink` resolution), special nodes (`FIFO`/`CHR`/`BLK`/`SOCK`), owners (`uid`/`gid`), extended timestamps (`atime`/`ctime`/`btime`), xattrs, tensor metadata TLVs, and shared Zstd dictionaries (`CDict`/`DDict`).
 * **Crash-Safe Incremental LSM Overlays & Tombstones:** `LsmAppendWriter` appends deltas without rewriting existing data clusters, supports overwrites and explicit file tombstones (`FLAG_TOMBSTONE`), and updates the Boot Block atomically.
-* **Zero-Reencode LSM Compaction:** Merges multi-run archives (`compact_archive_with_options`) by copying surviving compressed/encrypted clusters verbatim—reclaiming dead blocks without decompressing or recompressing live files.
+* **Zero-Reencode & Crash-Safe In-Place LSM Compaction:** Merges multi-run archives (`compact_archive_with_options`) by copying surviving compressed/encrypted clusters verbatim—or compacts files **in place** (`compact_file_in_place` / `vz compact --in-place`) via an `O(batch_bytes)` crash-safe, resumable EOF bounce journal (`INCOMPAT_COMPACTING`) without requiring `2x` temporary disk space.
 * **Two-Level Self-Healing Erasure Coding:**
   * **Boot ECC (`COMPAT_BOOT_ECC`):** Single-page 4 KiB XOR recovery across the first 15 pages (`0x0000..0xF000`) with automatic repair on open (`~5.85 µs` clean check).
   * **Stream ECC (`RO_COMPAT_STREAM_ECC`):** Reed-Solomon `GF(2^8)` Cauchy stripes `(K, M)` with `K + M <= 256` protecting data clusters against up to `M` arbitrary cluster corruptions/erasures.
@@ -87,7 +87,7 @@ Every `.vz` file starts with a fixed-size **Boot Block** (default `65,536 B` / `
 +-----------------------------------------------------------------------+
 ```
 
-See [`SPEC.md`](./SPEC.md) for byte-level layouts, TLV tags, LE-VINT rules, Boot ECC recovery invariants, and LSM overlay resolution order.
+See [`SPEC.md`](./SPEC.md) for concise byte layouts and [`draft-vz-archive-format-00.md`](./draft-vz-archive-format-00.md) for the full IETF mmark specification (including TLV tag governance, `TAG_VENDOR_EXT` anti-collision rules, and `INCOMPAT_COMPACTING`).
 
 ---
 
@@ -170,6 +170,9 @@ vz append assets.vz \
 # Compact multi-run LSM archive into a single clean run (zero re-encoding by default)
 vz compact assets.vz assets_compacted.vz
 
+# Compact directly in place using bounded O(batch) RAM/disk (crash-safe & resumable)
+vz compact --in-place --batch-mib 4 assets.vz
+
 # Unpack full archive (use --mmap for zero-copy memory-mapped reads)
 vz unpack assets_compacted.vz ./out --mmap
 ```
@@ -236,7 +239,7 @@ Both C and C++ headers are **automatically generated** during `cargo build -p li
 * **Zero-Copy Caller Buffers (`_into`):** `vz_archive_read_range_into` and `vz_fuse_read_into` write directly into caller-owned stack/ring buffers with zero per-call heap allocations.
 * **Chunked Streaming File Writes:** `vz_writer_file_begin`, `vz_writer_file_write`, `vz_writer_file_end`, and `vz_writer_file_abort` pack multi-gigabyte assets in bounded memory (`4.00 MiB` peak).
 * **Full POSIX & FUSE3 Surface:** `vz_fuse_mount`, `vz_fuse_lookup`, `vz_fuse_getattr`, `vz_fuse_readdir`, `vz_fuse_readdirplus`, `vz_fuse_open`, `vz_fuse_read_into`, `vz_fuse_readlink`, `vz_fuse_getxattr`, `vz_fuse_listxattr`, `vz_writer_add_special` (`FIFO`/`CHR`/`BLK`/`SOCK`), and `uid`/`gid`/`btime_ns` via `VzEntryOptionsC`.
-* **LSM Patch & Compact:** `vz_append_open`, `vz_append_add_file`, `vz_append_add_symlink`, `vz_append_add_hardlink`, `vz_append_delete`, `vz_archive_compact` (with `rs_parity_k` / `rs_parity_m`), and zero-alloc `vz_archive_readdir_visit`.
+* **LSM Patch & Compact:** `vz_append_open`, `vz_append_add_file`, `vz_append_add_symlink`, `vz_append_add_hardlink`, `vz_append_delete`, `vz_archive_compact` (with `rs_parity_k` / `rs_parity_m`), crash-safe `vz_archive_compact_in_place`, and zero-alloc `vz_archive_readdir_visit`.
 
 ### C11 Example ([`c_example.c`](crates/libvz-ffi/examples/c_example.c))
 

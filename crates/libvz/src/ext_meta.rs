@@ -1187,3 +1187,50 @@ pub fn decode_root_fallback(buf: &[u8]) -> Result<RootFallback, VzError> {
         embedded_root,
     })
 }
+
+/// Preserved raw TLV item for extension tags skipped or forwarded across LSM/compaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawTlv {
+    pub tag: u64,
+    pub value: Vec<u8>,
+}
+
+/// Self-identifying reverse-DNS downstream extension payload for [`crate::wire::TAG_VENDOR_EXT`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VendorExt {
+    /// Reverse-DNS namespace owned by the downstream creator (e.g., `"org.example.engine"`).
+    pub namespace: String,
+    /// Vendor-scoped sub-tag inside `namespace`.
+    pub sub_tag: u64,
+    /// Opaque vendor extension value bytes.
+    pub payload: Vec<u8>,
+}
+
+/// Encodes a [`VendorExt`] record for storage inside [`crate::wire::TAG_VENDOR_EXT`].
+pub fn encode_vendor_ext(ext: &VendorExt) -> Result<Vec<u8>, VzError> {
+    if ext.namespace.is_empty() {
+        return Err(VzError::InvalidInput);
+    }
+    let mut out = Vec::with_capacity(16 + ext.namespace.len() + ext.payload.len());
+    push_lp_bytes(&mut out, ext.namespace.as_bytes())?;
+    push_levint(&mut out, ext.sub_tag)?;
+    out.extend_from_slice(&ext.payload);
+    Ok(out)
+}
+
+/// Decodes a [`VendorExt`] record from a [`crate::wire::TAG_VENDOR_EXT`] TLV value slice.
+pub fn decode_vendor_ext(buf: &[u8]) -> Result<VendorExt, VzError> {
+    let (ns_bytes, rest) = read_lp_bytes(buf)?;
+    let namespace = core::str::from_utf8(ns_bytes)
+        .map_err(|_| VzError::BadFormat)?
+        .to_string();
+    if namespace.is_empty() {
+        return Err(VzError::BadFormat);
+    }
+    let (sub_tag, w) = read_levint_safe(rest)?;
+    Ok(VendorExt {
+        namespace,
+        sub_tag,
+        payload: rest[w..].to_vec(),
+    })
+}

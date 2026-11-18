@@ -11,7 +11,7 @@ use crate::ecc::boot_ecc_verify_and_repair;
 use crate::error::VzError;
 use crate::ext_meta::{
     ChunkExtent, CipherHeader, ColumnMeta, DataManifestHeader, DictEntry, ExtCodecMeta, LsmRunDesc,
-    OwnerEntry, SchemaEntry, SparseExtent, TensorMeta, Xattr, decode_chunk_table,
+    OwnerEntry, RawTlv, SchemaEntry, SparseExtent, TensorMeta, Xattr, decode_chunk_table,
     decode_dict_table, decode_ext_codec, decode_ext_owner, decode_lsm_runs, decode_owner_table,
     decode_root_fallback, decode_schema_link, decode_schema_table, decode_sparse_extents,
     decode_xattr_list, normalize_dir_path, split_archive_path, split_archive_path_borrowed,
@@ -80,6 +80,8 @@ pub struct ResolvedEntry {
     pub ext_codec: Option<ExtCodecMeta>,
     pub sparse_extents: Option<Vec<SparseExtent>>,
     pub schema_extra: Vec<u8>,
+    /// Unrecognized / downstream extension TLVs (e.g. `TAG_VENDOR_EXT`) preserved across compaction.
+    pub extra_ext_tlvs: Vec<RawTlv>,
 }
 
 /// Archive integrity verification report returned by [`verify_archive`].
@@ -153,6 +155,8 @@ pub struct VzReader<R: RangeReader> {
     cipher_hdr: Option<CipherHeader>,
     crypto: Option<CryptoContext>,
     lsm_runs: Vec<LsmRunDesc>,
+    /// Preserved downstream/unknown Global Registry TLVs.
+    extra_registry_tlvs: Vec<RawTlv>,
     /// Embedded root bytes when opened from an unfinalized pipe via `TAG_ROOT_FALLBACK`.
     pipe_root: Option<(u8, u32, Vec<u8>)>,
     /// Verified B+Tree internal/leaf node cache populated lazily on first cluster validation.
@@ -240,6 +244,7 @@ impl<R: RangeReader> VzReader<R> {
         let mut schemas = Vec::new();
         let mut cipher_hdr = None;
         let mut lsm_runs = Vec::new();
+        let mut extra_registry_tlvs = Vec::new();
 
         for elem in TlvIter::new(reg_slice) {
             let elem = elem?;
@@ -250,7 +255,10 @@ impl<R: RangeReader> VzReader<R> {
                 TAG_SCHEMA_TABLE => schemas = decode_schema_table(elem.value)?,
                 TAG_CIPHER_HEADER => cipher_hdr = Some(CipherHeader::from_bytes(elem.value)?),
                 TAG_LSM_RUNS => lsm_runs = decode_lsm_runs(elem.value)?,
-                _ => {}
+                other => extra_registry_tlvs.push(RawTlv {
+                    tag: other,
+                    value: elem.value.to_vec(),
+                }),
             }
         }
 
@@ -329,6 +337,7 @@ impl<R: RangeReader> VzReader<R> {
             cipher_hdr,
             crypto,
             lsm_runs,
+            extra_registry_tlvs,
             pipe_root,
             node_cache: RwLock::new(HashMap::new()),
         })
@@ -367,6 +376,10 @@ impl<R: RangeReader> VzReader<R> {
 
     pub fn lsm_runs(&self) -> &[LsmRunDesc] {
         &self.lsm_runs
+    }
+
+    pub fn extra_registry_tlvs(&self) -> &[RawTlv] {
+        &self.extra_registry_tlvs
     }
 
     pub fn reader(&self) -> &R {
@@ -1840,6 +1853,7 @@ impl<R: RangeReader> VzReader<R> {
         let mut ext_codec = None;
         let mut schema_link = None;
         let mut sparse_extents = None;
+        let mut extra_ext_tlvs = Vec::new();
         let mut resolved_parent = parent_path.to_string();
 
         if de.has_ext_meta() {
@@ -1870,7 +1884,11 @@ impl<R: RangeReader> VzReader<R> {
                     TAG_EXT_CODEC => ext_codec = Some(decode_ext_codec(elem.value)?),
                     TAG_SCHEMA_LINK => schema_link = Some(decode_schema_link(elem.value)?),
                     TAG_SPARSE_EXTENTS => sparse_extents = Some(decode_sparse_extents(elem.value)?),
-                    _ => {}
+                    crate::wire::TAG_VOID => {}
+                    other => extra_ext_tlvs.push(RawTlv {
+                        tag: other,
+                        value: elem.value.to_vec(),
+                    }),
                 }
             }
         }
@@ -1925,6 +1943,7 @@ impl<R: RangeReader> VzReader<R> {
             ext_codec,
             sparse_extents,
             schema_extra,
+            extra_ext_tlvs,
         })
     }
 
@@ -2268,6 +2287,49 @@ pub fn scan_clusters_forward<R: RangeReader>(
     Ok(out)
 }
 
+fn resync_next_cluster<R: RangeReader>(
+    reader: &R,
+    start_pos: u64,
+    total_len: u64,
+) -> Option<u64> {
+    let magic = MAGIC_CLUSTER.to_le_bytes();
+    let min_cluster = (ClusterHeader::SIZE + ClusterFooter::SIZE) as u64;
+    let chunk_size = 64 * 1024u64;
+    let mut pos = (start_pos + 7) & !7;
+    let mut buf = vec![0u8; chunk_size as usize + ClusterHeader::SIZE];
+
+    while pos + min_cluster <= total_len {
+        let read_len = ((total_len - pos).min(buf.len() as u64)) as usize;
+        if read_len < ClusterHeader::SIZE || reader.read_at(pos, &mut buf[..read_len]).is_err() {
+            return None;
+        }
+        let scan_end = read_len - ClusterHeader::SIZE;
+        let mut rel = 0usize;
+        while rel <= scan_end {
+            if buf[rel..rel + 8] == magic
+                && let Ok(chdr) = ClusterHeader::from_bytes(&buf[rel..rel + ClusterHeader::SIZE])
+                && chdr.cluster_len >= min_cluster
+                && (chdr.cluster_len & 7) == 0
+            {
+                let candidate = pos + rel as u64;
+                if candidate + chdr.cluster_len <= total_len
+                    && let Ok(cbuf) = read_cluster_at(reader, candidate)
+                    && validate_cluster(&cbuf).is_ok()
+                {
+                    return Some(candidate);
+                }
+            }
+            rel += 8;
+        }
+        let advance = (scan_end + 8).min(read_len) as u64;
+        if advance == 0 {
+            break;
+        }
+        pos += advance;
+    }
+    None
+}
+
 /// Performs full verification of Boot Block, Boot ECC, cluster links/CRCs, data manifests,
 /// `DirNode` CRCs, and RS parity stripes.
 pub fn verify_archive<R: RangeReader>(
@@ -2283,7 +2345,9 @@ pub fn verify_archive<R: RangeReader>(
         .as_ref()
         .ok()
         .and_then(|h| h.select_active(0xFFFF).ok())
-        .is_none_or(|(s, _)| (s.compat_flags & COMPAT_BOOT_ECC) != 0);
+        .is_none_or(|(s, _)| {
+            (s.compat_flags & COMPAT_BOOT_ECC) != 0 && s.boot_block_size as usize == DEFAULT_BOOT_SIZE
+        });
 
     if ecc_enabled {
         let mut test_boot = boot.clone();
@@ -2323,6 +2387,7 @@ pub fn verify_archive<R: RangeReader>(
     let mut pos = boot_end;
     let mut expected_prev = 0u64;
     let mut expected_seq = 0u64;
+    let mut just_resynced = false;
     let mut parity_stripes_seen: HashSet<u64> = HashSet::new();
 
     while pos < total_len {
@@ -2332,7 +2397,14 @@ pub fn verify_archive<R: RangeReader>(
                 report
                     .errors
                     .push(format!("cluster at offset {pos:#x} unreadable: {e}"));
-                break;
+                match resync_next_cluster(reader, pos + 8, total_len) {
+                    Some(next_pos) => {
+                        pos = next_pos;
+                        just_resynced = true;
+                        continue;
+                    }
+                    None => break,
+                }
             }
         };
         let (chdr, body, _) = match validate_cluster(&cbuf) {
@@ -2341,15 +2413,25 @@ pub fn verify_archive<R: RangeReader>(
                 report
                     .errors
                     .push(format!("cluster at offset {pos:#x} corrupt: {e}"));
-                break;
+                match resync_next_cluster(reader, pos + 8, total_len) {
+                    Some(next_pos) => {
+                        pos = next_pos;
+                        just_resynced = true;
+                        continue;
+                    }
+                    None => break,
+                }
             }
         };
-        if chdr.prev_cluster_len != expected_prev || chdr.cluster_seq != expected_seq {
+        if !just_resynced
+            && (chdr.prev_cluster_len != expected_prev || chdr.cluster_seq != expected_seq)
+        {
             report.errors.push(format!(
                 "cluster chain mismatch at {pos:#x}: seq={} (exp {}), prev_len={} (exp {})",
                 chdr.cluster_seq, expected_seq, chdr.prev_cluster_len, expected_prev
             ));
         }
+        just_resynced = false;
 
         for elem in TlvIter::new(body) {
             let elem = match elem {
@@ -2435,8 +2517,12 @@ pub fn repair_read_write_seek<S: Read + Write + Seek>(io: &mut S) -> Result<Repa
 
     let pre_ecc = BootHeader::from_bytes(&boot)
         .ok()
-        .and_then(|h| h.select_active(0xFFFF).ok().map(|(s, _)| s.compat_flags))
-        .is_none_or(|f| (f & COMPAT_BOOT_ECC) != 0);
+        .is_none_or(|h| {
+            h.select_active(0xFFFF).ok().is_none_or(|(s, _)| {
+                (s.compat_flags & COMPAT_BOOT_ECC) != 0
+                    && s.boot_block_size as usize == DEFAULT_BOOT_SIZE
+            })
+        });
 
     if pre_ecc
         && let Some(page) = boot_ecc_verify_and_repair(&mut boot)?
@@ -2489,6 +2575,7 @@ pub fn repair_read_write_seek<S: Read + Write + Seek>(io: &mut S) -> Result<Repa
     // Reconstruct each RS stripe that has any damaged data or parity clusters.
     let mut stripe_keys: Vec<u64> = found_parity_stripes.keys().copied().collect();
     stripe_keys.sort_unstable();
+    let mut any_unrecoverable = false;
 
     for first_seq in stripe_keys {
         let (p0_off, p_clen) = found_parity_stripes[&first_seq];
@@ -2511,12 +2598,19 @@ pub fn repair_read_write_seek<S: Read + Write + Seek>(io: &mut S) -> Result<Repa
                 && let Some((manifest, offs, payload)) = parse_parity_cluster_body(body)?
                 && manifest.first_cluster_seq == first_seq
             {
+                let k = manifest.data_clusters_k as usize;
                 let m = manifest.parity_clusters_m as usize;
+                let pidx = manifest.parity_index as usize;
+                if k == 0 || m == 0 || k + m > 256 || pidx >= m || offs.len() < k {
+                    any_unrecoverable = true;
+                    break;
+                }
                 if parity_raw_bufs.is_empty() {
                     parity_raw_bufs = vec![None; m];
                 }
-                parity_raw_bufs[manifest.parity_index as usize] =
-                    Some((manifest.parity_index, payload.to_vec()));
+                if pidx < parity_raw_bufs.len() {
+                    parity_raw_bufs[pidx] = Some((manifest.parity_index, payload.to_vec()));
+                }
                 if first_manifest.is_none() {
                     first_manifest = Some(manifest);
                     first_offsets = offs;
@@ -2537,6 +2631,10 @@ pub fn repair_read_write_seek<S: Read + Write + Seek>(io: &mut S) -> Result<Repa
         };
         let k = manifest.data_clusters_k as usize;
         let m = manifest.parity_clusters_m as usize;
+        if first_offsets.len() < k {
+            any_unrecoverable = true;
+            continue;
+        }
         let max_len = usize::try_from(manifest.max_cluster_len)
             .map_err(|_| VzError::ValueOverflow)?;
 
@@ -2549,7 +2647,7 @@ pub fn repair_read_write_seek<S: Read + Write + Seek>(io: &mut S) -> Result<Repa
                 p0_off
             };
             let span = next_off.saturating_sub(d_off).min(max_len as u64) as usize;
-            if span < ClusterHeader::SIZE + ClusterFooter::SIZE {
+            if span < ClusterHeader::SIZE + ClusterFooter::SIZE || d_off + span as u64 > total_len {
                 data_slots.push(None);
                 continue;
             }
@@ -2566,7 +2664,14 @@ pub fn repair_read_write_seek<S: Read + Write + Seek>(io: &mut S) -> Result<Repa
 
         let had_missing_data: Vec<bool> = data_slots.iter().map(Option::is_none).collect();
         let repaired_data =
-            recover_rs_gf256_stripe(&mut data_slots, &parity_raw_bufs, k, m, max_len)?;
+            match recover_rs_gf256_stripe(&mut data_slots, &parity_raw_bufs, k, m, max_len) {
+                Ok(n) => n,
+                Err(VzError::CorruptUnrecoverable) => {
+                    any_unrecoverable = true;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
         report.data_clusters_repaired += repaired_data;
 
         for (j, was_missing) in had_missing_data.iter().enumerate() {
@@ -2582,10 +2687,21 @@ pub fn repair_read_write_seek<S: Read + Write + Seek>(io: &mut S) -> Result<Repa
         // Re-encode and repair any damaged parity clusters in this stripe.
         let any_bad_parity = parity_raw_bufs.iter().any(Option::is_none);
         if any_bad_parity {
-            let data_refs: Vec<&[u8]> = data_slots
-                .iter()
-                .map(|o| o.as_deref().ok_or(VzError::CorruptUnrecoverable))
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut data_refs: Vec<&[u8]> = Vec::with_capacity(k);
+            let mut missing_after = false;
+            for slot in &data_slots {
+                match slot.as_deref() {
+                    Some(b) => data_refs.push(b),
+                    None => {
+                        missing_after = true;
+                        break;
+                    }
+                }
+            }
+            if missing_after {
+                any_unrecoverable = true;
+                continue;
+            }
             let last_data = data_refs[k - 1];
             let last_hdr = ClusterHeader::from_bytes(last_data)?;
             let prev_len_for_p = last_hdr.cluster_len;
@@ -2599,7 +2715,7 @@ pub fn repair_read_write_seek<S: Read + Write + Seek>(io: &mut S) -> Result<Repa
                 prev_len_for_p,
             )?;
             for (p_idx, p_slot) in parity_raw_bufs.iter().enumerate() {
-                if p_slot.is_none() {
+                if p_slot.is_none() && p_idx < rebuilt_parities.len() {
                     let p_off = p0_off + p_idx as u64 * p_clen as u64;
                     io.seek(SeekFrom::Start(p_off))
                         .map_err(|_| VzError::IoError)?;
@@ -2612,5 +2728,8 @@ pub fn repair_read_write_seek<S: Read + Write + Seek>(io: &mut S) -> Result<Repa
     }
 
     io.flush().map_err(|_| VzError::IoError)?;
+    if any_unrecoverable {
+        return Err(VzError::CorruptUnrecoverable);
+    }
     Ok(report)
 }

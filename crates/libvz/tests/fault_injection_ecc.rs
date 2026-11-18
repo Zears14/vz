@@ -144,3 +144,46 @@ fn test_rs_gf256_stripe_k6_m3_wipe_and_repair() {
     }
     assert_eq!(repair_slice(&mut buf_fail), Err(VzError::CorruptUnrecoverable));
 }
+
+#[test]
+fn test_verify_resyncs_past_bad_cluster_and_repair_saves_healthy_stripe() {
+    // Force >= 2 full RS(2,1) stripes so Stripe 0 has M+1 hits and Stripe 1 has 1 hit.
+    let cfg = VzWriterConfig {
+        target_cluster_size: 4096,
+        multi_cluster_threshold: 1024 * 1024,
+        rs_parity: Some((2, 1)),
+        ..Default::default()
+    };
+    let mut w = VzWriter::new(Cursor::new(Vec::new()), cfg).unwrap();
+    for i in 0..8 {
+        w.add_file(&format!("/s_{i:02}.bin"), &vec![(i + 1) as u8; 4096])
+            .unwrap();
+    }
+    let original = w.finish().unwrap().into_inner();
+    let clusters = scan_clusters_forward(&original, DEFAULT_BOOT_SIZE as u64).unwrap();
+    // Stripe 0: data 0,1 parity 2. Stripe 1: data 3,4 parity 5. Stripe 2+: 6..
+    assert!(clusters.len() >= 8);
+
+    // 1. Corrupt cluster 0 completely -> verify_archive MUST resync and still inspect clusters & parity stripes!
+    let mut one_bad = original.clone();
+    let (off0, hdr0) = clusters[0];
+    one_bad[off0 as usize..off0 as usize + hdr0.cluster_len as usize].fill(0);
+    let rep = verify_archive(&one_bad, None).unwrap();
+    assert!(!rep.is_clean());
+    assert!(rep.clusters_checked >= clusters.len() - 1);
+    assert!(rep.parity_stripes_checked >= 2);
+
+    // 2. Make Stripe 0 unrecoverable (wipe data 0 and data 1), AND wipe data 3 in Stripe 1 (recoverable).
+    // repair_slice must still repair Stripe 1 even though Stripe 0 returns CorruptUnrecoverable.
+    let mut mixed = original.clone();
+    for idx in [0usize, 1, 3] {
+        let (off, hdr) = clusters[idx];
+        mixed[off as usize..off as usize + hdr.cluster_len as usize].fill(0x55);
+    }
+    assert_eq!(repair_slice(&mut mixed), Err(VzError::CorruptUnrecoverable));
+    let (off3, hdr3) = clusters[3];
+    assert_eq!(
+        &mixed[off3 as usize..off3 as usize + hdr3.cluster_len as usize],
+        &original[off3 as usize..off3 as usize + hdr3.cluster_len as usize]
+    );
+}

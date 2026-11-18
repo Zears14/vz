@@ -589,3 +589,81 @@ fn test_hash_algos_xxh3_and_blake3() {
         assert_ne!(v1, v3);
     }
 }
+
+#[test]
+fn test_downstream_tlv_governance_and_compaction_preservation() {
+    use libvz::low_level::{
+        CompactOptions, EntryOptions, LsmAppendWriter, RawTlv, TAG_VENDOR_EXT, TLV_CORE_MAX,
+        TLV_PRIVATE_MAX, TLV_PRIVATE_MIN, TLV_REGISTERED_MAX, TLV_REGISTERED_MIN, VendorExt,
+        VzReader, VzWriter, VzWriterConfig, compact_archive_with_options, decode_vendor_ext,
+        encode_vendor_ext, is_downstream_allocatable_tag, vendor_pen_tag,
+    };
+    use std::io::Cursor;
+
+    assert!(!is_downstream_allocatable_tag(0x08));
+    assert!(!is_downstream_allocatable_tag(TLV_CORE_MAX));
+    assert!(is_downstream_allocatable_tag(TAG_VENDOR_EXT));
+    assert!(is_downstream_allocatable_tag(TLV_REGISTERED_MIN));
+    assert!(is_downstream_allocatable_tag(TLV_REGISTERED_MAX));
+    assert!(is_downstream_allocatable_tag(TLV_PRIVATE_MIN));
+    assert!(is_downstream_allocatable_tag(TLV_PRIVATE_MAX));
+
+    let pen_tag = vendor_pen_tag(4242, 7);
+    assert!(is_downstream_allocatable_tag(pen_tag));
+
+    let vext = VendorExt {
+        namespace: "org.example.engine".to_string(),
+        sub_tag: 99,
+        payload: b"asset-guid-123".to_vec(),
+    };
+    let vext_bytes = encode_vendor_ext(&vext).unwrap();
+    assert_eq!(decode_vendor_ext(&vext_bytes).unwrap(), vext);
+
+    let cfg = VzWriterConfig {
+        extra_registry_tlvs: vec![
+            RawTlv {
+                tag: TAG_VENDOR_EXT,
+                value: vext_bytes.clone(),
+            },
+            RawTlv {
+                tag: pen_tag,
+                value: b"global-pen".to_vec(),
+            },
+        ],
+        ..Default::default()
+    };
+    let mut w = VzWriter::new(Cursor::new(Vec::new()), cfg).unwrap();
+    let e_opts = EntryOptions {
+        extra_ext_tlvs: vec![RawTlv {
+            tag: TAG_VENDOR_EXT,
+            value: vext_bytes.clone(),
+        }],
+        ..Default::default()
+    };
+    w.add_file_with_options("/a.bin", b"hello-ext", e_opts)
+        .unwrap();
+    let buf = w.finish().unwrap().into_inner();
+
+    // Preserved across LSM append + zero-reencode compaction
+    let mut app = LsmAppendWriter::open(Cursor::new(buf), None, 512, 128).unwrap();
+    app.add_file("/b.bin", b"delta").unwrap();
+    let patched = app.finish().unwrap().into_inner();
+
+    let r = VzReader::open(patched).unwrap();
+    assert_eq!(r.extra_registry_tlvs().len(), 2);
+    assert_eq!(r.extra_registry_tlvs()[1].tag, pen_tag);
+
+    let live = r.list_all_live().unwrap();
+    let a = live.iter().find(|e| e.stat.name == "a.bin").unwrap();
+    assert_eq!(a.extra_ext_tlvs.len(), 1);
+    assert_eq!(decode_vendor_ext(&a.extra_ext_tlvs[0].value).unwrap(), vext);
+
+    let comp = compact_archive_with_options(&r, Cursor::new(Vec::new()), CompactOptions::default())
+        .unwrap()
+        .into_inner();
+    let r2 = VzReader::open(comp).unwrap();
+    assert_eq!(r2.extra_registry_tlvs().len(), 2);
+    let live2 = r2.list_all_live().unwrap();
+    let a2 = live2.iter().find(|e| e.stat.name == "a.bin").unwrap();
+    assert_eq!(a2.extra_ext_tlvs.len(), 1);
+}

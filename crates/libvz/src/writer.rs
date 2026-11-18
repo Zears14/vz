@@ -10,11 +10,11 @@ use crate::ecc::boot_ecc_encode;
 use crate::error::VzError;
 use crate::ext_meta::{
     ChunkExtent, CipherHeader, ColChunkStats, DataManifestHeader, DictEntry, ExtCodecMeta,
-    LsmRunDesc, OwnerEntry, RootFallback, SchemaEntry, SchemaLinkMeta, SparseExtent, Xattr,
-    encode_chunk_table,
-    encode_dict_table, encode_ext_codec, encode_ext_owner, encode_lsm_runs, encode_owner_table,
-    encode_root_fallback, encode_schema_link, encode_schema_table, encode_sparse_extents,
-    encode_xattr_list, push_levint, push_lp_bytes, push_tlv, split_archive_path,
+    LsmRunDesc, OwnerEntry, RawTlv, RootFallback, SchemaEntry, SchemaLinkMeta, SparseExtent, Xattr,
+    encode_chunk_table, encode_dict_table, encode_ext_codec, encode_ext_owner, encode_lsm_runs,
+    encode_owner_table, encode_root_fallback, encode_schema_link, encode_schema_table,
+    encode_sparse_extents, encode_xattr_list, push_levint, push_lp_bytes, push_tlv,
+    split_archive_path,
 };
 use crate::hash::{AlgoHasher, PathHasher};
 use crate::io::RangeReader;
@@ -66,6 +66,8 @@ pub struct VzWriterConfig {
     pub owners: Vec<OwnerEntry>,
     /// Enables `COMPAT_COL_STATS` flag when analytical column statistics are present.
     pub enable_col_stats: bool,
+    /// Optional custom / downstream Global Registry TLVs (e.g. `TAG_VENDOR_EXT`).
+    pub extra_registry_tlvs: Vec<RawTlv>,
 }
 
 impl Default for VzWriterConfig {
@@ -86,6 +88,7 @@ impl Default for VzWriterConfig {
             schemas: Vec::new(),
             owners: Vec::new(),
             enable_col_stats: false,
+            extra_registry_tlvs: Vec::new(),
         }
     }
 }
@@ -119,6 +122,8 @@ pub struct EntryOptions {
     pub col_stats: Option<ColChunkStats>,
     /// Optional sparse extents (`TAG_SPARSE_EXTENTS`) and logical file size (`FLAG_SPARSE`).
     pub sparse: Option<(u64, Vec<SparseExtent>)>,
+    /// Optional custom / downstream per-entry `ExtMetaPool` TLVs (e.g. `TAG_VENDOR_EXT`).
+    pub extra_ext_tlvs: Vec<RawTlv>,
 }
 
 impl Default for EntryOptions {
@@ -137,6 +142,7 @@ impl Default for EntryOptions {
             schema_extra: Vec::new(),
             col_stats: None,
             sparse: None,
+            extra_ext_tlvs: Vec::new(),
         }
     }
 }
@@ -159,6 +165,7 @@ struct StagedEntry {
     ext_codec: Option<ExtCodecMeta>,
     schema_link: Option<SchemaLinkMeta>,
     sparse_extents: Option<Vec<SparseExtent>>,
+    extra_ext_tlvs: Vec<RawTlv>,
 }
 
 struct ClusterEmitter<W: Write> {
@@ -696,6 +703,7 @@ impl<W: Write + Seek> VzWriter<W> {
             ext_codec: target.ext_codec,
             schema_link: target.schema_link,
             sparse_extents: target.sparse_extents,
+            extra_ext_tlvs: target.extra_ext_tlvs,
         });
         Ok(())
     }
@@ -899,6 +907,7 @@ impl<W: Write + Seek> VzWriter<W> {
             ext_codec: sf.ext_codec,
             schema_link,
             sparse_extents: None,
+            extra_ext_tlvs: sf.opts.extra_ext_tlvs,
         });
         Ok(())
     }
@@ -1099,6 +1108,7 @@ impl<W: Write + Seek> VzWriter<W> {
             },
             schema_link,
             sparse_extents,
+            extra_ext_tlvs: opts.extra_ext_tlvs,
         });
         Ok(())
     }
@@ -1127,6 +1137,7 @@ impl<W: Write + Seek> VzWriter<W> {
             &self.config.schemas,
             self.crypto.as_ref().map(|(h, _)| h),
             None,
+            &self.config.extra_registry_tlvs,
         )?;
 
         let boot_size = self.config.boot_block_size as usize;
@@ -1259,6 +1270,7 @@ fn build_registry_bytes(
     schemas: &[SchemaEntry],
     cipher_hdr: Option<&crate::ext_meta::CipherHeader>,
     lsm_runs: Option<&[LsmRunDesc]>,
+    extra_tlvs: &[RawTlv],
 ) -> Result<Vec<u8>, VzError> {
     let mut reg = Vec::new();
     if !owners.is_empty() {
@@ -1279,6 +1291,9 @@ fn build_registry_bytes(
     if let Some(runs) = lsm_runs {
         let val = encode_lsm_runs(runs)?;
         push_tlv(&mut reg, TAG_LSM_RUNS, &val)?;
+    }
+    for raw in extra_tlvs {
+        push_tlv(&mut reg, raw.tag, &raw.value)?;
     }
     Ok(reg)
 }
@@ -1314,6 +1329,11 @@ fn build_entry_ext_chain(e: &StagedEntry) -> Result<Vec<u8>, VzError> {
     if let Some(ref extents) = e.sparse_extents {
         let val = encode_sparse_extents(extents)?;
         push_tlv(&mut chain, TAG_SPARSE_EXTENTS, &val)?;
+    }
+    for raw in &e.extra_ext_tlvs {
+        if raw.tag != TAG_NOP {
+            push_tlv(&mut chain, raw.tag, &raw.value)?;
+        }
     }
     if !chain.is_empty() {
         chain.push(TAG_NOP as u8);
@@ -1443,9 +1463,10 @@ fn partition_leaves(entries: &[StagedEntry], max_leaf_entries: usize) -> Vec<(us
                 || e.ext_codec.is_some()
                 || e.schema_link.is_some()
                 || e.sparse_extents.is_some()
+                || !e.extra_ext_tlvs.is_empty()
                 || (e.flags_and_codec & FLAG_INODE_64) != 0
             {
-                64
+                64 + e.extra_ext_tlvs.iter().map(|t| 8 + t.value.len()).sum::<usize>()
             } else {
                 0
             };
@@ -1640,6 +1661,7 @@ impl<W: Write> VzPipeWriter<W> {
             &config.schemas,
             crypto.as_ref().map(|(h, _)| h),
             None,
+            &config.extra_registry_tlvs,
         )?;
         let boot_size = config.boot_block_size as usize;
         if 0x0080 + registry_bytes.len() > boot_size {
@@ -1896,6 +1918,7 @@ impl<W: Write> VzPipeWriter<W> {
                 extra: opts.schema_extra,
             }),
             sparse_extents: None,
+            extra_ext_tlvs: opts.extra_ext_tlvs,
         });
         Ok(())
     }
@@ -2004,6 +2027,7 @@ impl<W: Write> VzPipeWriter<W> {
             ext_codec,
             schema_link: None,
             sparse_extents: None,
+            extra_ext_tlvs: opts.extra_ext_tlvs,
         });
         Ok(())
     }
@@ -2187,6 +2211,7 @@ pub struct LsmAppendWriter<F: Read + Write + Seek + RangeReader> {
     crypto: Option<CryptoContext>,
     encryption_key: Option<EncryptionKey>,
     prev_runs: Vec<LsmRunDesc>,
+    extra_registry_tlvs: Vec<RawTlv>,
     hasher: Box<dyn PathHasher>,
     new_generation: u64,
     emitter: ClusterEmitter<F>,
@@ -2222,6 +2247,7 @@ impl<F: Read + Write + Seek + RangeReader> LsmAppendWriter<F> {
             owners,
             dicts,
             schemas,
+            extra_registry_tlvs,
             cipher_hdr,
             crypto,
             next_entry_id,
@@ -2235,6 +2261,7 @@ impl<F: Read + Write + Seek + RangeReader> LsmAppendWriter<F> {
             let owners = reader.owners().to_vec();
             let dicts = reader.dicts().to_vec();
             let schemas = reader.schemas().to_vec();
+            let extra_registry_tlvs = reader.extra_registry_tlvs().to_vec();
             let cipher_hdr = reader.cipher_header().copied();
             let crypto = reader.crypto_context().cloned();
             let next_entry_id = reader.max_entry_id()?.saturating_add(1).max(1);
@@ -2244,6 +2271,7 @@ impl<F: Read + Write + Seek + RangeReader> LsmAppendWriter<F> {
                 owners,
                 dicts,
                 schemas,
+                extra_registry_tlvs,
                 cipher_hdr,
                 crypto,
                 next_entry_id,
@@ -2313,6 +2341,7 @@ impl<F: Read + Write + Seek + RangeReader> LsmAppendWriter<F> {
             crypto,
             encryption_key: encryption,
             prev_runs,
+            extra_registry_tlvs,
             hasher,
             new_generation,
             emitter,
@@ -2412,6 +2441,7 @@ impl<F: Read + Write + Seek + RangeReader> LsmAppendWriter<F> {
                 ext_codec: target.ext_codec,
                 schema_link: target.schema_link,
                 sparse_extents: target.sparse_extents,
+                extra_ext_tlvs: target.extra_ext_tlvs,
             });
             return Ok(());
         }
@@ -2559,6 +2589,7 @@ impl<F: Read + Write + Seek + RangeReader> LsmAppendWriter<F> {
                 extra: opts.schema_extra,
             }),
             sparse_extents: None,
+            extra_ext_tlvs: opts.extra_ext_tlvs,
         });
         Ok(())
     }
@@ -2594,6 +2625,7 @@ impl<F: Read + Write + Seek + RangeReader> LsmAppendWriter<F> {
             ext_codec: None,
             schema_link: None,
             sparse_extents: None,
+            extra_ext_tlvs: Vec::new(),
         });
         Ok(())
     }
@@ -2664,6 +2696,7 @@ impl<F: Read + Write + Seek + RangeReader> LsmAppendWriter<F> {
             &self.schemas,
             self.cipher_hdr.as_ref(),
             Some(&all_runs),
+            &self.extra_registry_tlvs,
         )?;
         let registry_offset = 0x0080usize;
         let root_node_offset = align_up_64(registry_offset + registry_bytes.len());
@@ -2693,6 +2726,7 @@ impl<F: Read + Write + Seek + RangeReader> LsmAppendWriter<F> {
             &self.schemas,
             self.cipher_hdr.as_ref(),
             Some(&all_runs),
+            &self.extra_registry_tlvs,
         )?;
         if final_registry.len() != registry_bytes.len() {
             return Err(VzError::BadFormat);
@@ -3082,6 +3116,7 @@ pub fn compact_archive_with_options<R: RangeReader, W: Write + Seek>(
             ext_codec: entry.ext_codec,
             schema_link,
             sparse_extents: entry.sparse_extents,
+            extra_ext_tlvs: entry.extra_ext_tlvs.clone(),
         });
     }
 
@@ -3100,6 +3135,7 @@ pub fn compact_archive_with_options<R: RangeReader, W: Write + Seek>(
         &schemas,
         out_crypto.as_ref().map(|(h, _)| h),
         None,
+        reader.extra_registry_tlvs(),
     )?;
     let registry_offset = 0x0080usize;
     let root_node_offset = align_up_64(registry_offset + registry_bytes.len());
@@ -3189,6 +3225,9 @@ fn compact_reencode_inner<R: RangeReader, W: Write + Seek>(
     if config.owners.is_empty() {
         config.owners = reader.owners().to_vec();
     }
+    if config.extra_registry_tlvs.is_empty() {
+        config.extra_registry_tlvs = reader.extra_registry_tlvs().to_vec();
+    }
 
     let mut live = reader.list_all_live()?;
     live.sort_by(|a, b| {
@@ -3240,6 +3279,7 @@ fn compact_reencode_inner<R: RangeReader, W: Write + Seek>(
                     extra: entry.schema_extra,
                 }),
                 sparse_extents: target.sparse_extents,
+                extra_ext_tlvs: entry.extra_ext_tlvs.clone(),
             });
             continue;
         }
@@ -3266,6 +3306,7 @@ fn compact_reencode_inner<R: RangeReader, W: Write + Seek>(
             schema_extra: entry.schema_extra.clone(),
             col_stats: None,
             sparse: None,
+            extra_ext_tlvs: entry.extra_ext_tlvs.clone(),
         };
 
         let staged_idx = vz_writer.entries.len();
@@ -3276,9 +3317,11 @@ fn compact_reencode_inner<R: RangeReader, W: Write + Seek>(
             let exts = entry.sparse_extents.unwrap_or_default();
             let mut slices: Vec<(u64, &[u8])> = Vec::with_capacity(exts.len());
             for ext in &exts {
-                let s = ext.logical_offset as usize;
-                let e = s + ext.length as usize;
-                slices.push((ext.logical_offset, &full_bytes[s..e]));
+                let s = usize::try_from(ext.logical_offset).map_err(|_| VzError::ValueOverflow)?;
+                let len = usize::try_from(ext.length).map_err(|_| VzError::ValueOverflow)?;
+                let e = s.checked_add(len).ok_or(VzError::ValueOverflow)?;
+                let slice = full_bytes.get(s..e).ok_or(VzError::BadFormat)?;
+                slices.push((ext.logical_offset, slice));
             }
             vz_writer.add_sparse_file(&stage_path, entry.stat.size, &slices, opts)?;
         } else {

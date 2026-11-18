@@ -250,8 +250,8 @@ impl<R: RangeReader> FuseVolume<R> {
         let mut dir_path_to_ino: HashMap<String, u64> = HashMap::new();
         dir_path_to_ino.insert("/".to_string(), FUSE_ROOT_ID);
 
-        // Hardlink map: archival `entry_id` -> FUSE `ino` for non-directory files.
-        let mut hardlink_ino: HashMap<u64, u64> = HashMap::new();
+        // Hardlink map: archival `entry_id` -> `(ino, raw_size, stored_size)` for non-directory files.
+        let mut hardlink_ino: HashMap<u64, (u64, u64, u64)> = HashMap::new();
         let mut total_raw_bytes = 0u64;
 
         // First create explicit directory entries so directory permissions/timestamps win.
@@ -325,7 +325,11 @@ impl<R: RangeReader> FuseVolume<R> {
             let name = entry.stat.name.clone();
             let kind = FuseFileKind::from_wire_kind(entry.stat.kind);
 
-            if let Some(&shared_ino) = hardlink_ino.get(&entry.stat.entry_id) {
+            if let Some(&(shared_ino, expected_size, expected_stored)) =
+                hardlink_ino.get(&entry.stat.entry_id)
+                && expected_size == entry.stat.size
+                && expected_stored == entry.stat.stored_size
+            {
                 nodes[(shared_ino - 1) as usize].attr.nlink =
                     nodes[(shared_ino - 1) as usize].attr.nlink.saturating_add(1);
                 nodes[(parent_ino - 1) as usize]
@@ -385,7 +389,10 @@ impl<R: RangeReader> FuseVolume<R> {
 
             total_raw_bytes = total_raw_bytes.saturating_add(entry.stat.size);
             if matches!(kind, FuseFileKind::RegularFile) {
-                hardlink_ino.insert(entry.stat.entry_id, new_ino);
+                hardlink_ino.insert(
+                    entry.stat.entry_id,
+                    (new_ino, entry.stat.size, entry.stat.stored_size),
+                );
             }
             nodes.push(InodeNode {
                 attr,

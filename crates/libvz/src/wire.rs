@@ -106,8 +106,40 @@ pub const TAG_INODE_HI: u64 = 0x15;
 pub const TAG_EXT_CODEC: u64 = 0x16;
 /// Tensor/column schema ID link inside `ExtMetaPool` (`0x5C` on wire).
 pub const TAG_SCHEMA_LINK: u64 = 0x17;
+/// Self-identifying reverse-DNS vendor/downstream TLV extension (`0xE8` on wire).
+/// Value layout: `ns_len (LE-VINT) || ns_utf8 || sub_tag (LE-VINT) || payload_bytes`.
+pub const TAG_VENDOR_EXT: u64 = 0x3A;
 /// Standard LE-TLV Void element (`0xEC` on wire, always `[0xEC][LE-VINT len][bytes]`).
 pub const TAG_VOID: u64 = 0x3B;
+
+// --- TLV Governance Range Constants ---
+
+/// Maximum decoded TLV tag reserved exclusively for upstream core VZ Standards Action (`0x0FFF`).
+pub const TLV_CORE_MAX: u64 = 0x0FFF;
+/// Inclusive minimum decoded TLV tag for registered ecosystem extensions (Spec Required / FCFS).
+pub const TLV_REGISTERED_MIN: u64 = 0x1000;
+/// Inclusive maximum decoded TLV tag for registered 2-byte ecosystem extensions.
+pub const TLV_REGISTERED_MAX: u64 = 0x3BFF;
+/// Inclusive minimum decoded TLV tag for closed Private Use pipelines (`2`-byte LE-VINT).
+pub const TLV_PRIVATE_MIN: u64 = 0x3C00;
+/// Inclusive maximum decoded TLV tag for closed Private Use pipelines (`2`-byte LE-VINT).
+pub const TLV_PRIVATE_MAX: u64 = 0x3FFF;
+/// Base prefix for deterministic 4-byte IANA Private Enterprise Number (PEN) tags.
+pub const TLV_PEN_BASE: u64 = 0x1000_0000;
+
+/// Constructs a collision-free 4-byte LE-VINT TLV tag scoped by an IANA Private Enterprise
+/// Number (`pen`, low 20 bits) and a vendor-local `sub_tag` (`0..=255`).
+#[inline]
+pub const fn vendor_pen_tag(pen: u32, sub_tag: u8) -> u64 {
+    TLV_PEN_BASE | (((pen as u64) & 0xF_FFFF) << 8) | (sub_tag as u64)
+}
+
+/// Returns `true` if `tag` falls outside the upstream-reserved `0x0000..=0x0FFF` range
+/// (or equals [`TAG_VENDOR_EXT`]) and may be allocated cleanly by downstream implementations.
+#[inline]
+pub const fn is_downstream_allocatable_tag(tag: u64) -> bool {
+    tag == TAG_VENDOR_EXT || tag > TLV_CORE_MAX
+}
 
 // --- Entry Kinds (Upper 4 bits of `DirEntry::posix_mode`: bits 12..=15) ---
 

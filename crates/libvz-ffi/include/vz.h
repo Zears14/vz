@@ -420,6 +420,72 @@ VzStatus vz_verify_file(const char *path,
 // Repairs single-page Boot ECC and `<= M` RS-corrupted clusters at `path` in-place.
 VzStatus vz_repair_file(const char *path, struct VzRepairReportC *out);
 
+// Mounts an opened [`VzArchive`] into an in-memory `O(1)`/`O(log N)` FUSE3 volume.
+VzStatus vz_fuse_mount(const struct VzArchive *arc, struct VzFuseVol **out);
+
+// Unmounts and frees a [`VzFuseVol`] handle.
+void vz_fuse_unmount(struct VzFuseVol *vol);
+
+// FUSE3 `getattr(ino)` (`O(1)`, zero disk I/O).
+VzStatus vz_fuse_getattr(const struct VzFuseVol *vol, uint64_t ino, struct VzFuseAttrC *out);
+
+// FUSE3 `lookup(parent_ino, name)` (`O(log dir_len)`, zero disk I/O).
+VzStatus vz_fuse_lookup(const struct VzFuseVol *vol,
+                        uint64_t parent_ino,
+                        const char *name,
+                        struct VzFuseAttrC *out);
+
+// FUSE3 `readdirplus(ino, offset, limit)` paginated listing with full attributes (zero disk I/O).
+// Caller must free `out` via [`vz_fuse_dir_free`].
+VzStatus vz_fuse_readdirplus(const struct VzFuseVol *vol,
+                             uint64_t ino,
+                             uint64_t offset,
+                             uintptr_t limit,
+                             struct VzFuseDirListC *out);
+
+// Opens a FUSE3 file handle (`fh`) on `ino`, pre-loading any `TAG_CHUNK_TABLE` once.
+VzStatus vz_fuse_open(const struct VzFuseVol *vol, uint64_t ino, struct VzFuseFh **out);
+
+// Closes and frees a [`VzFuseFh`] handle.
+void vz_fuse_close(struct VzFuseFh *fh);
+
+// Reads `[offset, offset + len)` from `fh` (chunk-cached for compressed/encrypted streams,
+// exact `read_at` for `CODEC_NONE`, zero-I/O for sparse holes). Caller frees `out` via [`vz_bytes_free`].
+VzStatus vz_fuse_read(const struct VzFuseVol *vol,
+                      const struct VzFuseFh *fh,
+                      uint64_t offset,
+                      uintptr_t len,
+                      struct VzBytes *out);
+
+// Zero-copy FUSE3 `read(fh, offset, len)` directly into caller-provided `dst[0..dst_cap]`.
+// Sets `*out_written` to actual bytes written; returns `VZ_ERR_BUFFER_TOO_SMALL` if `dst_cap`
+// is smaller than the clamped read size.
+VzStatus vz_fuse_read_into(const struct VzFuseVol *vol,
+                           const struct VzFuseFh *fh,
+                           uint64_t offset,
+                           uintptr_t len,
+                           uint8_t *dst,
+                           uintptr_t dst_cap,
+                           uintptr_t *out_written);
+
+// FUSE3 `readlink(ino)`: reads symlink target bytes for `VZ_KIND_LNK` inodes.
+// Caller frees `out` via [`vz_bytes_free`].
+VzStatus vz_fuse_readlink(const struct VzFuseVol *vol, uint64_t ino, struct VzBytes *out);
+
+// FUSE3 `getxattr(ino, name)`: `O(xattrs.len())` zero-I/O extended attribute read.
+// Caller frees `out` via [`vz_bytes_free`].
+VzStatus vz_fuse_getxattr(const struct VzFuseVol *vol,
+                          uint64_t ino,
+                          const char *name,
+                          struct VzBytes *out);
+
+// FUSE3 `listxattr(ino)`: returns NUL-separated POSIX attribute names (`name1\0name2\0...`).
+// Caller frees `out` via [`vz_bytes_free`].
+VzStatus vz_fuse_listxattr(const struct VzFuseVol *vol, uint64_t ino, struct VzBytes *out);
+
+// Fills container-wide `statfs` counters from `vol`.
+VzStatus vz_fuse_statfs(const struct VzFuseVol *vol, struct VzFuseStatFsC *out);
+
 // Creates a new `.vz` archive file at `path`. Finalize with [`vz_writer_finish`].
 VzStatus vz_writer_create(const char *path,
                           const struct VzWriterConfigC *cfg,
@@ -520,72 +586,6 @@ VzStatus vz_append_finish(struct VzAppendHandle *a);
 
 // Aborts and frees an unfinalized [`VzAppendHandle`].
 void vz_append_abort(struct VzAppendHandle *a);
-
-// Mounts an opened [`VzArchive`] into an in-memory `O(1)`/`O(log N)` FUSE3 volume.
-VzStatus vz_fuse_mount(const struct VzArchive *arc, struct VzFuseVol **out);
-
-// Unmounts and frees a [`VzFuseVol`] handle.
-void vz_fuse_unmount(struct VzFuseVol *vol);
-
-// FUSE3 `getattr(ino)` (`O(1)`, zero disk I/O).
-VzStatus vz_fuse_getattr(const struct VzFuseVol *vol, uint64_t ino, struct VzFuseAttrC *out);
-
-// FUSE3 `lookup(parent_ino, name)` (`O(log dir_len)`, zero disk I/O).
-VzStatus vz_fuse_lookup(const struct VzFuseVol *vol,
-                        uint64_t parent_ino,
-                        const char *name,
-                        struct VzFuseAttrC *out);
-
-// FUSE3 `readdirplus(ino, offset, limit)` paginated listing with full attributes (zero disk I/O).
-// Caller must free `out` via [`vz_fuse_dir_free`].
-VzStatus vz_fuse_readdirplus(const struct VzFuseVol *vol,
-                             uint64_t ino,
-                             uint64_t offset,
-                             uintptr_t limit,
-                             struct VzFuseDirListC *out);
-
-// Opens a FUSE3 file handle (`fh`) on `ino`, pre-loading any `TAG_CHUNK_TABLE` once.
-VzStatus vz_fuse_open(const struct VzFuseVol *vol, uint64_t ino, struct VzFuseFh **out);
-
-// Closes and frees a [`VzFuseFh`] handle.
-void vz_fuse_close(struct VzFuseFh *fh);
-
-// Reads `[offset, offset + len)` from `fh` (chunk-cached for compressed/encrypted streams,
-// exact `read_at` for `CODEC_NONE`, zero-I/O for sparse holes). Caller frees `out` via [`vz_bytes_free`].
-VzStatus vz_fuse_read(const struct VzFuseVol *vol,
-                      const struct VzFuseFh *fh,
-                      uint64_t offset,
-                      uintptr_t len,
-                      struct VzBytes *out);
-
-// Zero-copy FUSE3 `read(fh, offset, len)` directly into caller-provided `dst[0..dst_cap]`.
-// Sets `*out_written` to actual bytes written; returns `VZ_ERR_BUFFER_TOO_SMALL` if `dst_cap`
-// is smaller than the clamped read size.
-VzStatus vz_fuse_read_into(const struct VzFuseVol *vol,
-                           const struct VzFuseFh *fh,
-                           uint64_t offset,
-                           uintptr_t len,
-                           uint8_t *dst,
-                           uintptr_t dst_cap,
-                           uintptr_t *out_written);
-
-// FUSE3 `readlink(ino)`: reads symlink target bytes for `VZ_KIND_LNK` inodes.
-// Caller frees `out` via [`vz_bytes_free`].
-VzStatus vz_fuse_readlink(const struct VzFuseVol *vol, uint64_t ino, struct VzBytes *out);
-
-// FUSE3 `getxattr(ino, name)`: `O(xattrs.len())` zero-I/O extended attribute read.
-// Caller frees `out` via [`vz_bytes_free`].
-VzStatus vz_fuse_getxattr(const struct VzFuseVol *vol,
-                          uint64_t ino,
-                          const char *name,
-                          struct VzBytes *out);
-
-// FUSE3 `listxattr(ino)`: returns NUL-separated POSIX attribute names (`name1\0name2\0...`).
-// Caller frees `out` via [`vz_bytes_free`].
-VzStatus vz_fuse_listxattr(const struct VzFuseVol *vol, uint64_t ino, struct VzBytes *out);
-
-// Fills container-wide `statfs` counters from `vol`.
-VzStatus vz_fuse_statfs(const struct VzFuseVol *vol, struct VzFuseStatFsC *out);
 
 #ifdef __cplusplus
 }  // extern "C"

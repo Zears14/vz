@@ -59,25 +59,48 @@ pub fn compress_payload_with_cache(
     cache: Option<&ZstdDictCache>,
     zstd_level: i32,
 ) -> Result<Vec<u8>, VzError> {
+    let mut out = Vec::new();
+    compress_payload_into_with_cache(raw, &mut out, codec, ext_codec, dicts, cache, zstd_level)?;
+    Ok(out)
+}
+
+/// Compresses `raw` directly into caller-owned `out` (clearing `out` first), eliminating
+/// per-entry buffer allocations in sequential writer loops.
+pub fn compress_payload_into_with_cache(
+    raw: &[u8],
+    out: &mut Vec<u8>,
+    codec: u8,
+    ext_codec: Option<&ExtCodecMeta>,
+    dicts: &[DictEntry],
+    cache: Option<&ZstdDictCache>,
+    zstd_level: i32,
+) -> Result<(), VzError> {
+    out.clear();
     match codec {
-        CODEC_NONE => Ok(raw.to_vec()),
-        CODEC_LZ4 => compress_lz4(raw),
+        CODEC_NONE => {
+            out.extend_from_slice(raw);
+            Ok(())
+        }
+        CODEC_LZ4 => compress_lz4_into(raw, out),
         CODEC_ZSTD => {
             if let Some(ext) = ext_codec
                 && ext.dict_id != 0
             {
-                return compress_zstd_dict_cached(raw, ext.dict_id, dicts, cache, zstd_level);
+                return compress_zstd_dict_into(raw, out, ext.dict_id, dicts, cache, zstd_level);
             }
-            compress_zstd(raw, zstd_level)
+            compress_zstd_into(raw, out, zstd_level)
         }
         CODEC_EXT => {
             let ext = ext_codec.ok_or(VzError::BadFormat)?;
             match ext.ext_codec_id {
-                EXT_CODEC_NONE => Ok(raw.to_vec()),
-                EXT_CODEC_LZ4 => compress_lz4(raw),
-                EXT_CODEC_ZSTD => compress_zstd(raw, zstd_level),
+                EXT_CODEC_NONE => {
+                    out.extend_from_slice(raw);
+                    Ok(())
+                }
+                EXT_CODEC_LZ4 => compress_lz4_into(raw, out),
+                EXT_CODEC_ZSTD => compress_zstd_into(raw, out, zstd_level),
                 EXT_CODEC_ZSTD_DICT => {
-                    compress_zstd_dict_cached(raw, ext.dict_id, dicts, cache, zstd_level)
+                    compress_zstd_dict_into(raw, out, ext.dict_id, dicts, cache, zstd_level)
                 }
                 _ => Err(VzError::Unsupported),
             }
@@ -169,22 +192,88 @@ pub fn decompress_payload(
 }
 
 #[cfg(feature = "compression")]
-fn compress_lz4(raw: &[u8]) -> Result<Vec<u8>, VzError> {
+fn lz4_default_header_7b() -> [u8; 7] {
+    static HDR: std::sync::OnceLock<[u8; 7]> = std::sync::OnceLock::new();
+    *HDR.get_or_init(|| {
+        let mut hdr = [0u8; 7];
+        let enc = lz4_flex::frame::FrameEncoder::new(Vec::with_capacity(16));
+        if let Ok(done) = enc.finish()
+            && done.len() >= 7
+        {
+            hdr.copy_from_slice(&done[..7]);
+        }
+        hdr
+    })
+}
+
+#[cfg(feature = "compression")]
+fn compress_lz4_into(raw: &[u8], out: &mut Vec<u8>) -> Result<(), VzError> {
     use std::io::Write;
-    let bound = lz4_flex::block::get_maximum_output_size(raw.len()).saturating_add(32);
-    let mut enc = lz4_flex::frame::FrameEncoder::new(Vec::with_capacity(bound));
+    if raw.len() <= 64 * 1024 {
+        let hdr = lz4_default_header_7b();
+        let max_blk = lz4_flex::block::get_maximum_output_size(raw.len());
+        out.clear();
+        out.resize(11 + max_blk + 4, 0);
+        out[..7].copy_from_slice(&hdr);
+        let clen = lz4_flex::block::compress_into(raw, &mut out[11..11 + max_blk])
+            .map_err(|_| VzError::CompressionError)?;
+        if clen < raw.len() || raw.is_empty() {
+            out[7..11].copy_from_slice(&(clen as u32).to_le_bytes());
+            out[11 + clen..15 + clen].fill(0);
+            out.truncate(15 + clen);
+        } else {
+            // Incompressible block: store raw with LZ4 frame uncompressed bit (bit 31).
+            out[7..11].copy_from_slice(&(0x8000_0000u32 | (raw.len() as u32)).to_le_bytes());
+            out[11..11 + raw.len()].copy_from_slice(raw);
+            out[11 + raw.len()..15 + raw.len()].fill(0);
+            out.truncate(15 + raw.len());
+        }
+        return Ok(());
+    }
+    out.clear();
+    let buf = core::mem::take(out);
+    let mut enc = lz4_flex::frame::FrameEncoder::new(buf);
     enc.write_all(raw).map_err(|_| VzError::CompressionError)?;
-    enc.finish().map_err(|_| VzError::CompressionError)
+    *out = enc.finish().map_err(|_| VzError::CompressionError)?;
+    Ok(())
 }
 
 #[cfg(not(feature = "compression"))]
-fn compress_lz4(_raw: &[u8]) -> Result<Vec<u8>, VzError> {
+fn compress_lz4_into(_raw: &[u8], _out: &mut Vec<u8>) -> Result<(), VzError> {
     Err(VzError::Unsupported)
 }
 
 #[cfg(feature = "compression")]
 fn decompress_lz4_into(stored: &[u8], out: &mut Vec<u8>, raw_size: usize) -> Result<(), VzError> {
     use std::io::Read;
+    // Zero-alloc single-block fast path for independent LZ4 frames without extra header/checksum fields.
+    if stored.len() >= 15
+        && stored[..4] == [0x04, 0x22, 0x4D, 0x18]
+        && (stored[4] & 0b1101_1111) == 0x40
+        && (stored[5] & 0x8F) == 0
+    {
+        let blk_hdr = u32::from_le_bytes([stored[7], stored[8], stored[9], stored[10]]);
+        let blk_len = (blk_hdr & 0x7FFF_FFFF) as usize;
+        if 11 + blk_len + 4 == stored.len() && stored[11 + blk_len..] == [0, 0, 0, 0] {
+            let blk = &stored[11..11 + blk_len];
+            out.clear();
+            if (blk_hdr & 0x8000_0000) != 0 {
+                if blk_len != raw_size {
+                    return Err(VzError::CompressionError);
+                }
+                out.extend_from_slice(blk);
+                return Ok(());
+            }
+            out.resize(raw_size, 0);
+            let n = lz4_flex::block::decompress_into(blk, out)
+                .map_err(|_| VzError::CompressionError)?;
+            if n != raw_size {
+                return Err(VzError::CompressionError);
+            }
+            return Ok(());
+        }
+    }
+
     out.reserve(raw_size.min(4 * 1024 * 1024));
     let mut dec = lz4_flex::frame::FrameDecoder::new(stored);
     dec.read_to_end(out)
@@ -209,14 +298,15 @@ std::thread_local! {
 }
 
 #[cfg(feature = "compression")]
-fn compress_zstd(raw: &[u8], level: i32) -> Result<Vec<u8>, VzError> {
+fn compress_zstd_into(raw: &[u8], out: &mut Vec<u8>, level: i32) -> Result<(), VzError> {
     let bound = zstd::zstd_safe::compress_bound(raw.len());
-    let mut out = Vec::with_capacity(bound);
+    out.clear();
+    out.reserve(bound);
     let res = ZSTD_COMP_TLS.try_with(|cell| -> Result<(), VzError> {
         let Ok(mut slot) = cell.try_borrow_mut() else {
             let mut comp =
                 zstd::bulk::Compressor::new(level).map_err(|_| VzError::CompressionError)?;
-            comp.compress_to_buffer(raw, &mut out)
+            comp.compress_to_buffer(raw, out)
                 .map_err(|_| VzError::CompressionError)?;
             return Ok(());
         };
@@ -227,13 +317,13 @@ fn compress_zstd(raw: &[u8], level: i32) -> Result<Vec<u8>, VzError> {
                         .map_err(|_| VzError::CompressionError)?;
                     *cur_lvl = level;
                 }
-                comp.compress_to_buffer(raw, &mut out)
+                comp.compress_to_buffer(raw, out)
                     .map_err(|_| VzError::CompressionError)?;
             }
             None => {
                 let mut comp =
                     zstd::bulk::Compressor::new(level).map_err(|_| VzError::CompressionError)?;
-                comp.compress_to_buffer(raw, &mut out)
+                comp.compress_to_buffer(raw, out)
                     .map_err(|_| VzError::CompressionError)?;
                 *slot = Some((level, comp));
             }
@@ -241,16 +331,19 @@ fn compress_zstd(raw: &[u8], level: i32) -> Result<Vec<u8>, VzError> {
         Ok(())
     });
     match res {
-        Ok(r) => {
-            r?;
-            Ok(out)
+        Ok(r) => r,
+        Err(_) => {
+            let mut comp =
+                zstd::bulk::Compressor::new(level).map_err(|_| VzError::CompressionError)?;
+            comp.compress_to_buffer(raw, out)
+                .map_err(|_| VzError::CompressionError)?;
+            Ok(())
         }
-        Err(_) => zstd::bulk::compress(raw, level).map_err(|_| VzError::CompressionError),
     }
 }
 
 #[cfg(not(feature = "compression"))]
-fn compress_zstd(_raw: &[u8], _level: i32) -> Result<Vec<u8>, VzError> {
+fn compress_zstd_into(_raw: &[u8], _out: &mut Vec<u8>, _level: i32) -> Result<(), VzError> {
     Err(VzError::Unsupported)
 }
 
@@ -295,23 +388,25 @@ fn decompress_zstd_into(_stored: &[u8], _out: &mut Vec<u8>, _raw_size: usize) ->
 }
 
 #[cfg(feature = "compression")]
-fn compress_zstd_dict_cached(
+fn compress_zstd_dict_into(
     raw: &[u8],
+    out: &mut Vec<u8>,
     dict_id: u32,
     dicts: &[DictEntry],
     cache: Option<&ZstdDictCache>,
     level: i32,
-) -> Result<Vec<u8>, VzError> {
+) -> Result<(), VzError> {
     let bound = zstd::zstd_safe::compress_bound(raw.len());
-    let mut out = Vec::with_capacity(bound);
+    out.clear();
+    out.reserve(bound);
     if let Some(c) = cache
         && let Some(cdict) = c.cdicts.get(&dict_id)
     {
         let mut comp = zstd::bulk::Compressor::with_prepared_dictionary(cdict)
             .map_err(|_| VzError::CompressionError)?;
-        comp.compress_to_buffer(raw, &mut out)
+        comp.compress_to_buffer(raw, out)
             .map_err(|_| VzError::CompressionError)?;
-        return Ok(out);
+        return Ok(());
     }
     let dict = dicts
         .iter()
@@ -319,19 +414,20 @@ fn compress_zstd_dict_cached(
         .ok_or(VzError::NotFound)?;
     let mut comp = zstd::bulk::Compressor::with_dictionary(level, &dict.bytes)
         .map_err(|_| VzError::CompressionError)?;
-    comp.compress_to_buffer(raw, &mut out)
+    comp.compress_to_buffer(raw, out)
         .map_err(|_| VzError::CompressionError)?;
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(not(feature = "compression"))]
-fn compress_zstd_dict_cached(
+fn compress_zstd_dict_into(
     _raw: &[u8],
+    _out: &mut Vec<u8>,
     _dict_id: u32,
     _dicts: &[DictEntry],
     _cache: Option<&ZstdDictCache>,
     _level: i32,
-) -> Result<Vec<u8>, VzError> {
+) -> Result<(), VzError> {
     Err(VzError::Unsupported)
 }
 
@@ -433,7 +529,26 @@ impl EncryptionKey {
 /// Active encryption/decryption context holding the unwrapped Content Encryption Key (CEK).
 #[derive(Clone)]
 pub struct CryptoContext {
+    #[cfg(not(feature = "crypto"))]
+    #[allow(dead_code)]
     payload_key: [u8; 32],
+    #[cfg(feature = "crypto")]
+    cipher: chacha20poly1305::XChaCha20Poly1305,
+}
+
+impl CryptoContext {
+    #[cfg(feature = "crypto")]
+    fn from_payload_key(payload_key: [u8; 32]) -> Self {
+        use chacha20poly1305::{XChaCha20Poly1305, aead::KeyInit};
+        let cipher = XChaCha20Poly1305::new((&payload_key).into());
+        Self { cipher }
+    }
+
+    #[cfg(not(feature = "crypto"))]
+    #[allow(dead_code)]
+    fn from_payload_key(payload_key: [u8; 32]) -> Self {
+        Self { payload_key }
+    }
 }
 
 impl core::fmt::Debug for CryptoContext {
@@ -544,7 +659,7 @@ impl CryptoContext {
             wrap_nonce,
             wrapped_cek,
         };
-        Ok((hdr, Self { payload_key }))
+        Ok((hdr, Self::from_payload_key(payload_key)))
     }
 
     #[cfg(not(feature = "crypto"))]
@@ -601,11 +716,51 @@ impl CryptoContext {
         let mut cek = [0u8; 32];
         cek.copy_from_slice(&cek_vec);
         let payload_key = hkdf_expand(&hdr.salt, &cek, b"VZ-v1-PAYLOAD")?;
-        Ok(Self { payload_key })
+        Ok(Self::from_payload_key(payload_key))
     }
 
     #[cfg(not(feature = "crypto"))]
     pub fn unlock(_hdr: &crate::ext_meta::CipherHeader, _key: &EncryptionKey) -> Result<Self, VzError> {
+        Err(VzError::Unsupported)
+    }
+
+    /// Encrypts `plaintext` with `XChaCha20-Poly1305` into `out` (clearing `out` first).
+    #[cfg(feature = "crypto")]
+    pub fn encrypt_payload_into(
+        &self,
+        generation: u64,
+        cluster_seq: u64,
+        entry_id: u64,
+        plaintext: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), VzError> {
+        use chacha20poly1305::aead::AeadInPlace;
+        use rand_core::{OsRng, RngCore};
+
+        let mut nonce = [0u8; 24];
+        OsRng.fill_bytes(&mut nonce);
+        let aad = build_payload_aad(generation, cluster_seq, entry_id);
+        out.clear();
+        out.reserve(24 + plaintext.len() + 16);
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(plaintext);
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached((&nonce).into(), &aad, &mut out[24..])
+            .map_err(|_| VzError::CryptoError)?;
+        out.extend_from_slice(&tag);
+        Ok(())
+    }
+
+    #[cfg(not(feature = "crypto"))]
+    pub fn encrypt_payload_into(
+        &self,
+        _generation: u64,
+        _cluster_seq: u64,
+        _entry_id: u64,
+        _plaintext: &[u8],
+        _out: &mut Vec<u8>,
+    ) -> Result<(), VzError> {
         Err(VzError::Unsupported)
     }
 
@@ -618,20 +773,8 @@ impl CryptoContext {
         entry_id: u64,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, VzError> {
-        use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-        use chacha20poly1305::XChaCha20Poly1305;
-        use rand_core::{OsRng, RngCore};
-
-        let mut nonce = [0u8; 24];
-        OsRng.fill_bytes(&mut nonce);
-        let aad = build_payload_aad(generation, cluster_seq, entry_id);
-        let cipher = XChaCha20Poly1305::new((&self.payload_key).into());
-        let ct = cipher
-            .encrypt((&nonce).into(), Payload { msg: plaintext, aad: &aad })
-            .map_err(|_| VzError::CryptoError)?;
-        let mut out = Vec::with_capacity(24 + ct.len());
-        out.extend_from_slice(&nonce);
-        out.extend_from_slice(&ct);
+        let mut out = Vec::new();
+        self.encrypt_payload_into(generation, cluster_seq, entry_id, plaintext, &mut out)?;
         Ok(out)
     }
 
@@ -646,6 +789,48 @@ impl CryptoContext {
         Err(VzError::Unsupported)
     }
 
+    /// Decrypts `[24B nonce][ciphertext][16B tag]` directly into `out` (zero extra intermediate alloc).
+    #[cfg(feature = "crypto")]
+    pub fn decrypt_payload_into(
+        &self,
+        generation: u64,
+        cluster_seq: u64,
+        entry_id: u64,
+        stored: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), VzError> {
+        use chacha20poly1305::aead::AeadInPlace;
+
+        if stored.len() < 40 {
+            return Err(VzError::CryptoError);
+        }
+        let nonce = &stored[..24];
+        let pt_len = stored.len() - 40;
+        let ct = &stored[24..24 + pt_len];
+        let tag = &stored[24 + pt_len..];
+        let aad = build_payload_aad(generation, cluster_seq, entry_id);
+        out.clear();
+        out.extend_from_slice(ct);
+        self.cipher
+            .decrypt_in_place_detached(nonce.into(), &aad, out, tag.into())
+            .map_err(|_| {
+                out.clear();
+                VzError::CryptoError
+            })
+    }
+
+    #[cfg(not(feature = "crypto"))]
+    pub fn decrypt_payload_into(
+        &self,
+        _generation: u64,
+        _cluster_seq: u64,
+        _entry_id: u64,
+        _stored: &[u8],
+        _out: &mut Vec<u8>,
+    ) -> Result<(), VzError> {
+        Err(VzError::Unsupported)
+    }
+
     /// Decrypts `[24B nonce][ciphertext][16B tag]` using AAD `(generation, cluster_seq, entry_id)`.
     #[cfg(feature = "crypto")]
     pub fn decrypt_payload(
@@ -655,19 +840,9 @@ impl CryptoContext {
         entry_id: u64,
         stored: &[u8],
     ) -> Result<Vec<u8>, VzError> {
-        use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-        use chacha20poly1305::XChaCha20Poly1305;
-
-        if stored.len() < 40 {
-            return Err(VzError::CryptoError);
-        }
-        let nonce = &stored[..24];
-        let ct = &stored[24..];
-        let aad = build_payload_aad(generation, cluster_seq, entry_id);
-        let cipher = XChaCha20Poly1305::new((&self.payload_key).into());
-        cipher
-            .decrypt(nonce.into(), Payload { msg: ct, aad: &aad })
-            .map_err(|_| VzError::CryptoError)
+        let mut out = Vec::new();
+        self.decrypt_payload_into(generation, cluster_seq, entry_id, stored, &mut out)?;
+        Ok(out)
     }
 
     #[cfg(not(feature = "crypto"))]

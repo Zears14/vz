@@ -100,7 +100,7 @@ impl<W: Write> ClusterEmitter<W> {
         self.emit_raw_cluster_bytes(cluster)
     }
 
-    pub(super)fn flush_parity_stripe(&mut self) -> Result<(), VzError> {
+    pub(super) fn flush_parity_stripe(&mut self) -> Result<(), VzError> {
         let Some((_k, m)) = self.rs_parity else {
             return Ok(());
         };
@@ -129,6 +129,16 @@ impl<W: Write> ClusterEmitter<W> {
         self.stripe_clusters.clear();
         self.stripe_offsets.clear();
         Ok(())
+    }
+
+    pub(super) fn next_data_cluster_seq(&self, chunk_index: usize) -> u64 {
+        let parities_before = match self.rs_parity {
+            Some((k, m)) => {
+                ((self.stripe_clusters.len() + chunk_index) / k as usize) as u64 * m as u64
+            }
+            None => 0,
+        };
+        self.cluster_seq + chunk_index as u64 + parities_before
     }
 
     pub(super) fn flush_pending_data_cluster(&mut self) -> Result<(), VzError> {

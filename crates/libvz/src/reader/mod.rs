@@ -130,7 +130,6 @@ pub struct DirEntryRef<'a> {
 }
 
 pub(super) struct CachedNode {
-    pub(super) level: u8,
     pub(super) entry_count: u32,
     pub(super) payload: Arc<[u8]>,
 }

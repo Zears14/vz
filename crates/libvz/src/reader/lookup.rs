@@ -230,54 +230,29 @@ impl<R: RangeReader> VzReader<R> {
 
     /// Returns all live entries across the archive (used by compaction, bulk extraction, and FUSE).
     pub fn list_all_live(&self) -> Result<Vec<ResolvedEntry>, VzError> {
+        if self.lsm_runs.len() == 1 {
+            let mut items = self.collect_all_in_run_raw(&self.lsm_runs[0])?;
+            Self::resolve_missing_dir_parents(&*self.hasher, std::slice::from_mut(&mut items))?;
+            items.retain(|e| !e.dir_entry.is_tombstone());
+            return Ok(items);
+        }
+
         // Collect newest-to-oldest so global directory BFS resolves parent paths for overlay
         // tombstones and updates emitted without redundant KIND_DIR headers in delta runs.
         let mut runs_rev: Vec<Vec<ResolvedEntry>> = Vec::with_capacity(self.lsm_runs.len());
+        let mut total_est = 0usize;
         for run in self.lsm_runs.iter().rev() {
-            runs_rev.push(self.collect_all_in_run_raw(run)?);
+            let r = self.collect_all_in_run_raw(run)?;
+            total_est += r.len();
+            runs_rev.push(r);
         }
 
-        let mut dir_paths_by_hash: HashMap<u64, String> = HashMap::new();
-        let root_h = self.hasher.hash(b"/")?;
-        dir_paths_by_hash.insert(root_h, "/".to_string());
-        loop {
-            let mut progressed = false;
-            for run_items in &runs_rev {
-                for item in run_items {
-                    if (item.stat.kind & KIND_MASK) == crate::wire::KIND_DIR
-                        && !item.dir_entry.is_tombstone()
-                        && let Some(parent_str) =
-                            dir_paths_by_hash.get(&item.dir_entry.parent_hash).cloned()
-                    {
-                        let full = if parent_str == "/" {
-                            format!("/{}", item.stat.name)
-                        } else {
-                            format!("{parent_str}/{}", item.stat.name)
-                        };
-                        let h = self.hasher.hash(full.as_bytes())?;
-                        if let std::collections::hash_map::Entry::Vacant(e) =
-                            dir_paths_by_hash.entry(h)
-                        {
-                            e.insert(full);
-                            progressed = true;
-                        }
-                    }
-                }
-            }
-            if !progressed {
-                break;
-            }
-        }
+        Self::resolve_missing_dir_parents(&*self.hasher, &mut runs_rev)?;
 
-        let mut seen: HashSet<(u64, String, String)> = HashSet::new();
-        let mut out = Vec::new();
+        let mut seen: HashSet<(u64, String, String)> = HashSet::with_capacity(total_est);
+        let mut out = Vec::with_capacity(total_est);
         for run_items in runs_rev {
-            for mut entry in run_items {
-                if entry.stat.parent_path.is_empty()
-                    && let Some(p) = dir_paths_by_hash.get(&entry.dir_entry.parent_hash)
-                {
-                    entry.stat.parent_path = p.clone();
-                }
+            for entry in run_items {
                 let key = (
                     entry.dir_entry.parent_hash,
                     entry.stat.parent_path.clone(),
@@ -295,12 +270,84 @@ impl<R: RangeReader> VzReader<R> {
         Ok(out)
     }
 
+    fn resolve_missing_dir_parents(
+        hasher: &dyn crate::hash::PathHasher,
+        runs: &mut [Vec<ResolvedEntry>],
+    ) -> Result<(), VzError> {
+        if !runs
+            .iter()
+            .any(|run_items| run_items.iter().any(|e| e.stat.parent_path.is_empty()))
+        {
+            return Ok(());
+        }
+        let mut dir_paths_by_hash: HashMap<u64, String> = HashMap::new();
+        let root_h = hasher.hash(b"/")?;
+        dir_paths_by_hash.insert(root_h, "/".to_string());
+        loop {
+            let mut progressed = false;
+            for run_items in runs.iter() {
+                for item in run_items {
+                    if (item.stat.kind & KIND_MASK) == crate::wire::KIND_DIR
+                        && !item.dir_entry.is_tombstone()
+                        && let Some(parent_str) =
+                            dir_paths_by_hash.get(&item.dir_entry.parent_hash).cloned()
+                    {
+                        let full = if parent_str == "/" {
+                            format!("/{}", item.stat.name)
+                        } else {
+                            format!("{parent_str}/{}", item.stat.name)
+                        };
+                        let h = hasher.hash(full.as_bytes())?;
+                        if let std::collections::hash_map::Entry::Vacant(e) =
+                            dir_paths_by_hash.entry(h)
+                        {
+                            e.insert(full);
+                            progressed = true;
+                        }
+                    }
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        for run_items in runs.iter_mut() {
+            for entry in run_items {
+                if entry.stat.parent_path.is_empty()
+                    && let Some(p) = dir_paths_by_hash.get(&entry.dir_entry.parent_hash)
+                {
+                    entry.stat.parent_path = p.clone();
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn max_entry_id(&self) -> Result<u64, VzError> {
         let mut max_id = 0u64;
         for run in &self.lsm_runs {
-            for entry in self.collect_all_in_run_raw(run)? {
-                max_id = max_id.max(entry.stat.entry_id);
-            }
+            self.visit_all_leaves(
+                NodeRef {
+                    off: run.root_offset,
+                    is_cluster: run.root_is_cluster,
+                    cluster_len: None,
+                    height: run.tree_height,
+                    entry_count: run.root_entry_count as usize,
+                },
+                &mut |leaf| {
+                    let ext_pool = leaf.ext_meta_pool();
+                    for i in 0..leaf.entry_count() {
+                        let de = leaf.entry(i)?;
+                        let eid = if (de.flags_and_codec & FLAG_INODE_64) != 0 {
+                            de.full_entry_id(ext_pool)?
+                        } else {
+                            de.entry_id_lo as u64
+                        };
+                        max_id = max_id.max(eid);
+                    }
+                    Ok(())
+                },
+            )?;
         }
         Ok(max_id)
     }
@@ -370,9 +417,8 @@ impl<R: RangeReader> VzReader<R> {
                 }
             };
             let (_, body, _) = validate_cluster(slice)?;
-            let (level, count, payload) = parse_dir_node_body(body)?;
+            let (_level, count, payload) = parse_dir_node_body(body)?;
             Arc::new(CachedNode {
-                level,
                 entry_count: count,
                 payload: Arc::from(payload),
             })
@@ -386,9 +432,8 @@ impl<R: RangeReader> VzReader<R> {
                 None => read_cluster_at(&self.reader, offset)?,
             };
             let (_, body, _) = validate_cluster(&cluster_buf)?;
-            let (level, count, payload) = parse_dir_node_body(body)?;
+            let (_level, count, payload) = parse_dir_node_body(body)?;
             Arc::new(CachedNode {
-                level,
                 entry_count: count,
                 payload: Arc::from(payload),
             })
@@ -568,24 +613,6 @@ impl<R: RangeReader> VzReader<R> {
         }
     }
 
-    fn read_node_bytes(&self, offset: u64, is_cluster: bool, expected_len: Option<u32>) -> Result<(u8, u32, Vec<u8>), VzError> {
-        if let Some((h, cnt, ref root_bytes)) = self.pipe_root
-            && !is_cluster
-            && offset == 0
-        {
-            return Ok((h, cnt, root_bytes.clone()));
-        }
-        if !is_cluster {
-            let off = usize::try_from(offset).map_err(|_| VzError::ValueOverflow)?;
-            if off >= self.boot_block.len() {
-                return Err(VzError::BufferTooSmall);
-            }
-            return Ok((0, 0, self.boot_block[off..].to_vec()));
-        }
-        let cached = self.read_cluster_node_cached(offset, expected_len)?;
-        Ok((cached.level, cached.entry_count, cached.payload.to_vec()))
-    }
-
     fn lookup_in_run(
         &self,
         run: &LsmRunDesc,
@@ -602,36 +629,25 @@ impl<R: RangeReader> VzReader<R> {
 
         loop {
             if cur_height == 0 {
-                let leaf_slice = if cur_is_cluster {
-                    let (_, _, bytes) = self.read_node_bytes(cur_off, true, cur_cluster_len)?;
-                    bytes
+                let leaf_owned: Arc<CachedNode>;
+                let leaf_slice: &[u8] = if cur_is_cluster {
+                    leaf_owned = self.read_cluster_node_cached(cur_off, cur_cluster_len)?;
+                    &leaf_owned.payload
                 } else if let Some((_, _, ref pipe_bytes)) = self.pipe_root {
-                    pipe_bytes.clone()
+                    pipe_bytes.as_slice()
                 } else {
                     let off = usize::try_from(cur_off).map_err(|_| VzError::ValueOverflow)?;
                     if off >= self.boot_block.len() {
                         return Err(VzError::BufferTooSmall);
                     }
-                    // Only slice Boot Block directly!
-                    let leaf = LeafNodeView::parse(&self.boot_block[off..])?;
-                    if let Some(de) = leaf.lookup_raw_exact(
-                        parent_hash,
-                        name_hash,
-                        Some(basename.as_bytes()),
-                        Some(parent_path.as_bytes()),
-                    )? {
-                        return Ok(Some(self.decode_resolved_entry(
-                            &de,
-                            leaf.name_pool(),
-                            leaf.ext_meta_pool(),
-                            parent_path,
-                            run.run_generation,
-                        )?));
-                    }
-                    return Ok(None);
+                    &self.boot_block[off..]
                 };
 
-                let leaf = LeafNodeView::parse_trusted(&leaf_slice)?;
+                let leaf = if cur_is_cluster || self.pipe_root.is_some() {
+                    LeafNodeView::parse_trusted(leaf_slice)?
+                } else {
+                    LeafNodeView::parse(leaf_slice)?
+                };
                 if let Some(de) = leaf.lookup_raw_exact(
                     parent_hash,
                     name_hash,
@@ -651,8 +667,8 @@ impl<R: RangeReader> VzReader<R> {
 
             // Internal node: `RouteTableView`.
             let route = if cur_is_cluster {
-                let (_, cnt, bytes) = self.read_node_bytes(cur_off, true, cur_cluster_len)?;
-                let table = RouteTableView::new(&bytes, cnt as usize)?;
+                let cached = self.read_cluster_node_cached(cur_off, cur_cluster_len)?;
+                let table = RouteTableView::new(&cached.payload, cached.entry_count as usize)?;
                 table.lookup(parent_hash, name_hash)?
             } else if let Some((_, cnt, ref pipe_bytes)) = self.pipe_root {
                 let table = RouteTableView::new(pipe_bytes, cnt as usize)?;
@@ -747,10 +763,12 @@ impl<R: RangeReader> VzReader<R> {
                 let leaf = LeafNodeView::parse_trusted(&cached.payload)?;
                 return visitor(&leaf);
             }
+            if let Some((_, _, ref pipe_bytes)) = self.pipe_root {
+                let leaf = LeafNodeView::parse(pipe_bytes)?;
+                return visitor(&leaf);
+            }
             let _ = scratch;
-            let (_, _, bytes) = self.read_node_bytes(node.off, node.is_cluster, node.cluster_len)?;
-            let leaf = LeafNodeView::parse(&bytes)?;
-            return visitor(&leaf);
+            return Err(VzError::BadFormat);
         }
 
         let routes: Vec<RouteEntry> = if !node.is_cluster && self.pipe_root.is_none() {
@@ -770,8 +788,16 @@ impl<R: RangeReader> VzReader<R> {
             }
             v
         } else {
-            let (_, cnt, bytes) = self.read_node_bytes(node.off, node.is_cluster, node.cluster_len)?;
-            let table = RouteTableView::new(&bytes, cnt as usize)?;
+            let cached_holder: Arc<CachedNode>;
+            let (node_slice, cnt) = if node.is_cluster {
+                cached_holder = self.read_cluster_node_cached(node.off, node.cluster_len)?;
+                (&cached_holder.payload[..], cached_holder.entry_count as usize)
+            } else if let Some((_, cnt, ref pipe_bytes)) = self.pipe_root {
+                (pipe_bytes.as_slice(), cnt as usize)
+            } else {
+                return Err(VzError::BadFormat);
+            };
+            let table = RouteTableView::new(node_slice, cnt)?;
             let start = match table.lower_bound(parent_hash, 0)? {
                 Some((i, _)) => i,
                 None => return Ok(()),
@@ -845,9 +871,16 @@ impl<R: RangeReader> VzReader<R> {
                 let leaf = LeafNodeView::parse(&self.boot_block[off..])?;
                 return visitor(&leaf);
             }
-            let (_, _, bytes) = self.read_node_bytes(node.off, node.is_cluster, node.cluster_len)?;
-            let leaf = LeafNodeView::parse(&bytes)?;
-            return visitor(&leaf);
+            if node.is_cluster {
+                let cached = self.read_cluster_node_cached(node.off, node.cluster_len)?;
+                let leaf = LeafNodeView::parse_trusted(&cached.payload)?;
+                return visitor(&leaf);
+            }
+            if let Some((_, _, ref pipe_bytes)) = self.pipe_root {
+                let leaf = LeafNodeView::parse(pipe_bytes)?;
+                return visitor(&leaf);
+            }
+            return Err(VzError::BadFormat);
         }
 
         let routes: Vec<RouteEntry> = if !node.is_cluster && self.pipe_root.is_none() {
@@ -856,12 +889,19 @@ impl<R: RangeReader> VzReader<R> {
             (0..table.len())
                 .map(|i| table.get(i))
                 .collect::<Result<Vec<_>, _>>()?
-        } else {
-            let (_, cnt, bytes) = self.read_node_bytes(node.off, node.is_cluster, node.cluster_len)?;
-            let table = RouteTableView::new(&bytes, cnt as usize)?;
+        } else if node.is_cluster {
+            let cached = self.read_cluster_node_cached(node.off, node.cluster_len)?;
+            let table = RouteTableView::new(&cached.payload, cached.entry_count as usize)?;
             (0..table.len())
                 .map(|i| table.get(i))
                 .collect::<Result<Vec<_>, _>>()?
+        } else if let Some((_, cnt, ref pipe_bytes)) = self.pipe_root {
+            let table = RouteTableView::new(pipe_bytes, cnt as usize)?;
+            (0..table.len())
+                .map(|i| table.get(i))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            return Err(VzError::BadFormat);
         };
 
         for r in routes {

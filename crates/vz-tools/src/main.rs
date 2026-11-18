@@ -324,7 +324,71 @@ fn cmd_pack(
         return Ok(());
     }
 
+    let multi_thresh = config.multi_cluster_threshold as u64;
     let mut writer = VzWriter::new(out_file, config).map_err(|e| format!("writer init: {e}"))?;
+    let mut reg_batch: Vec<(PathBuf, String, EntryOptions)> = Vec::new();
+    let mut batch_bytes = 0usize;
+
+    let flush_batch =
+        |writer: &mut VzWriter<File>,
+         batch: &mut Vec<(PathBuf, String, EntryOptions)>,
+         bytes: &mut usize|
+         -> Result<(), String> {
+            if batch.is_empty() {
+                return Ok(());
+            }
+            let threads = std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .min(batch.len());
+            let file_bytes: Vec<Vec<u8>> = if threads > 1 && batch.len() >= 8 {
+                let chunk_sz = batch.len().div_ceil(threads);
+                let results: Vec<Result<Vec<Vec<u8>>, String>> = std::thread::scope(|s| {
+                    let handles: Vec<_> = batch
+                        .chunks(chunk_sz)
+                        .map(|chunk| {
+                            s.spawn(move || -> Result<Vec<Vec<u8>>, String> {
+                                let mut out = Vec::with_capacity(chunk.len());
+                                for (hp, _, _) in chunk {
+                                    out.push(
+                                        fs::read(hp)
+                                            .map_err(|e| format!("read {}: {e}", hp.display()))?,
+                                    );
+                                }
+                                Ok(out)
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().map_err(|_| "worker panicked".to_string())?)
+                        .collect()
+                });
+                let mut merged = Vec::with_capacity(batch.len());
+                for r in results {
+                    merged.extend(r?);
+                }
+                merged
+            } else {
+                let mut merged = Vec::with_capacity(batch.len());
+                for (hp, _, _) in batch.iter() {
+                    merged.push(fs::read(hp).map_err(|e| format!("read {}: {e}", hp.display()))?);
+                }
+                merged
+            };
+
+            let refs: Vec<(&str, &[u8], &EntryOptions)> = batch
+                .iter()
+                .zip(file_bytes.iter())
+                .map(|((_, ap, opts), data)| (ap.as_str(), data.as_slice(), opts))
+                .collect();
+            writer
+                .add_files_batch(&refs)
+                .map_err(|e| format!("add_files_batch: {e}"))?;
+            batch.clear();
+            *bytes = 0;
+            Ok(())
+        };
+
     for (host_path, arch_path, meta) in items {
         let mtime_ns = mtime_ns_from_meta(&meta);
         let owner = owner_from_meta(&meta);
@@ -356,19 +420,31 @@ fn cmd_pack(
                 owner,
                 ..Default::default()
             };
-            let f = File::open(&host_path)
-                .map_err(|e| format!("open {}: {e}", host_path.display()))?;
-            writer
-                .add_file_reader(&arch_path, f, opts)
-                .map_err(|e| format!("add_file {arch_path}: {e}"))?;
+            let flen = meta.len();
+            if flen > multi_thresh {
+                flush_batch(&mut writer, &mut reg_batch, &mut batch_bytes)?;
+                let f = File::open(&host_path)
+                    .map_err(|e| format!("open {}: {e}", host_path.display()))?;
+                writer
+                    .add_file_reader(&arch_path, f, opts)
+                    .map_err(|e| format!("add_file {arch_path}: {e}"))?;
+            } else {
+                batch_bytes = batch_bytes.saturating_add(flen as usize);
+                reg_batch.push((host_path, arch_path, opts));
+                if reg_batch.len() >= 512 || batch_bytes >= 8 * 1024 * 1024 {
+                    flush_batch(&mut writer, &mut reg_batch, &mut batch_bytes)?;
+                }
+            }
         }
     }
+    flush_batch(&mut writer, &mut reg_batch, &mut batch_bytes)?;
     writer.finish().map_err(|e| format!("finish: {e}"))?;
     Ok(())
 }
 
 fn unpack_with_reader<R: libvz::RangeReader>(reader: &VzReader<R>, dest: &Path) -> Result<(), String> {
     fs::create_dir_all(dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))?;
+    let mut last_dir: Option<PathBuf> = None;
     reader
         .extract_all_with(|item, data| {
             let rel_dir = item.stat.parent_path.trim_start_matches('/');
@@ -377,7 +453,10 @@ fn unpack_with_reader<R: libvz::RangeReader>(reader: &VzReader<R>, dest: &Path) 
             } else {
                 dest.join(rel_dir)
             };
-            fs::create_dir_all(&host_dir).map_err(|_| VzError::IoError)?;
+            if last_dir.as_ref() != Some(&host_dir) {
+                fs::create_dir_all(&host_dir).map_err(|_| VzError::IoError)?;
+                last_dir = Some(host_dir.clone());
+            }
             let host_path = host_dir.join(&item.stat.name);
 
             if item.stat.kind == KIND_DIR {

@@ -267,8 +267,13 @@ impl<R: RangeReader> FuseVolume<R> {
             } else {
                 format!("{}/{}", entry.stat.parent_path, entry.stat.name)
             };
-            let parent_ino =
-                ensure_dir_chain(&entry.stat.parent_path, &mut nodes, &mut dir_path_to_ino);
+            let parent_ino = if entry.stat.parent_path == "/" {
+                FUSE_ROOT_ID
+            } else if let Some(&ino) = dir_path_to_ino.get(&entry.stat.parent_path) {
+                ino
+            } else {
+                ensure_dir_chain(&entry.stat.parent_path, &mut nodes, &mut dir_path_to_ino)
+            };
             let ino = if let Some(&existing_ino) = dir_path_to_ino.get(&full_dir) {
                 existing_ino
             } else {
@@ -315,8 +320,10 @@ impl<R: RangeReader> FuseVolume<R> {
             if (entry.stat.kind & KIND_MASK) == KIND_DIR {
                 continue;
             }
-            let parent_ino = if entry.stat.parent_path.is_empty() {
+            let parent_ino = if entry.stat.parent_path.is_empty() || entry.stat.parent_path == "/" {
                 FUSE_ROOT_ID
+            } else if let Some(&ino) = dir_path_to_ino.get(&entry.stat.parent_path) {
+                ino
             } else {
                 ensure_dir_chain(&entry.stat.parent_path, &mut nodes, &mut dir_path_to_ino)
             };

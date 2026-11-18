@@ -156,15 +156,36 @@ pub fn compact_archive_with_options<R: RangeReader, W: Write + Seek>(
 
     let mut live = reader.list_all_live()?;
     live.sort_by(|a, b| {
-        a.stat
-            .parent_path
-            .cmp(&b.stat.parent_path)
+        let key = |e: &crate::reader::ResolvedEntry| match e.dir_entry.payload {
+            DirPayload::Inline { .. } => (0u8, 0u64, 0u32),
+            DirPayload::Ref {
+                data_offset,
+                in_cluster_offset,
+                ..
+            } => {
+                if e.dir_entry.is_multi_cluster() {
+                    (2u8, data_offset, in_cluster_offset)
+                } else {
+                    (1u8, data_offset, in_cluster_offset)
+                }
+            }
+        };
+        key(a)
+            .cmp(&key(b))
+            .then_with(|| a.stat.parent_path.cmp(&b.stat.parent_path))
             .then_with(|| a.stat.name.cmp(&b.stat.name))
     });
 
     // Deduplicate identical hardlink payloads by (entry_id, data_offset, in_cluster_offset).
     let mut copied_payloads: HashMap<(u64, u64, u32), DirPayload> = HashMap::new();
     let mut staged: Vec<StagedEntry> = Vec::with_capacity(live.len());
+    let contig = reader.reader().contiguous_bytes();
+    let mut cached_contig: Option<(u64, u64, usize)> = None;
+    let mut cached_cluster_off: Option<u64> = None;
+    let mut cached_cluster_seq = 0u64;
+    let mut cluster_buf = Vec::new();
+    let mut decrypt_buf = Vec::new();
+    let mut encrypt_buf = Vec::new();
 
     for entry in live {
         let de = entry.dir_entry;
@@ -273,41 +294,78 @@ pub fn compact_archive_with_options<R: RangeReader, W: Write + Seek>(
                         } else {
                             raw_size
                         };
-                        let compressed_bytes = if reader.crypto_context().is_some() {
-                            reader.read_encrypted_cluster_chunk(
-                                data_offset,
-                                in_cluster_offset,
-                                slen,
-                                entry.run_generation,
-                                entry.stat.entry_id,
-                            )?
+                        let (src_cluster_seq, cluster_slice): (u64, &[u8]) = if let Some(all) = contig
+                        {
+                            if let Some((co, seq, clen)) = cached_contig
+                                && co == data_offset
+                            {
+                                let off_u = data_offset as usize;
+                                (seq, &all[off_u..off_u + clen])
+                            } else {
+                                let (chdr, sl) = VzReader::<R>::load_validated_cluster(
+                                    reader.reader(),
+                                    Some(all),
+                                    data_offset,
+                                    &mut cluster_buf,
+                                )?;
+                                cached_contig = Some((data_offset, chdr.cluster_seq, sl.len()));
+                                (chdr.cluster_seq, sl)
+                            }
                         } else {
-                            let src_off = data_offset
-                                .checked_add(in_cluster_offset as u64)
-                                .ok_or(VzError::ValueOverflow)?;
-                            reader.read_raw_stored_bytes(src_off, slen)?
+                            if cached_cluster_off != Some(data_offset) {
+                                let (chdr, _) = VzReader::<R>::load_validated_cluster(
+                                    reader.reader(),
+                                    None,
+                                    data_offset,
+                                    &mut cluster_buf,
+                                )?;
+                                cached_cluster_off = Some(data_offset);
+                                cached_cluster_seq = chdr.cluster_seq;
+                            }
+                            (cached_cluster_seq, cluster_buf.as_slice())
                         };
-                        let est_add = 16 + DataManifestHeader::SIZE + 64 + compressed_bytes.len() + 40;
+                        let ioff = in_cluster_offset as usize;
+                        let end = ioff.checked_add(slen).ok_or(VzError::ValueOverflow)?;
+                        let stored_slice =
+                            cluster_slice.get(ioff..end).ok_or(VzError::BufferTooSmall)?;
+                        let plain_slice: &[u8] = if let Some(ctx) = reader.crypto_context() {
+                            ctx.decrypt_payload_into(
+                                entry.run_generation,
+                                src_cluster_seq,
+                                entry.stat.entry_id,
+                                stored_slice,
+                                &mut decrypt_buf,
+                            )?;
+                            &decrypt_buf
+                        } else {
+                            stored_slice
+                        };
+                        let est_add =
+                            16 + DataManifestHeader::SIZE + 64 + plain_slice.len() + if out_crypto.is_some() { 80 } else { 40 };
                         if !emitter.pending_body.is_empty()
                             && emitter.pending_body.len() + est_add > emitter.target_cluster_size
                         {
                             emitter.flush_pending_data_cluster()?;
                         }
                         let seq = emitter.cluster_seq;
-                        let out_stored = match &out_crypto {
-                            Some((_, ctx)) => ctx.encrypt_payload(
-                                target_generation,
-                                seq,
-                                entry.stat.entry_id,
-                                &compressed_bytes,
-                            )?,
-                            None => compressed_bytes,
+                        let out_slice: &[u8] = match &out_crypto {
+                            Some((_, ctx)) => {
+                                ctx.encrypt_payload_into(
+                                    target_generation,
+                                    seq,
+                                    entry.stat.entry_id,
+                                    plain_slice,
+                                    &mut encrypt_buf,
+                                )?;
+                                &encrypt_buf
+                            }
+                            None => plain_slice,
                         };
-                        let out_slen = out_stored.len() as u64;
+                        let out_slen = out_slice.len() as u64;
                         let (coff, ioff, actual_seq) = emitter.append_data_payload(
                             entry.stat.entry_id,
                             logical_or_packed_raw,
-                            &out_stored,
+                            out_slice,
                             None,
                         )?;
                         if actual_seq != seq {

@@ -473,6 +473,35 @@ fn print_ls_dir<R: libvz::RangeReader>(
     Ok(())
 }
 
+struct PipeSafeWriter<W> {
+    inner: W,
+    broken_pipe: bool,
+}
+
+impl<W: Write> Write for PipeSafeWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self.inner.write(buf) {
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+                self.broken_pipe = true;
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self.inner.flush() {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+                self.broken_pipe = true;
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
 fn run() -> Result<(), String> {
     let cli = Cli::parse();
     match cli.command {
@@ -574,7 +603,11 @@ fn run() -> Result<(), String> {
                 );
             }
             if let Some(o) = st.owner {
-                println!("owner: {}:{} ({}:{})", o.uid, o.gid, o.uname, o.gname);
+                if o.uname.is_empty() && o.gname.is_empty() {
+                    println!("owner: {}:{}", o.uid, o.gid);
+                } else {
+                    println!("owner: {}:{} ({}:{})", o.uid, o.gid, o.uname, o.gname);
+                }
             }
             if !st.xattrs.is_empty() {
                 println!("xattrs: {}", st.xattrs.len());
@@ -600,11 +633,20 @@ fn run() -> Result<(), String> {
                 },
             )
             .map_err(|e| format!("open vz: {e}"))?;
-            let mut stdout = io::stdout().lock();
-            reader
-                .read_file_to_writer(&path, &mut stdout)
-                .map_err(|e| format!("cat: {e}"))?;
-            stdout.flush().map_err(|e| format!("flush: {e}"))
+            let mut stdout = PipeSafeWriter {
+                inner: io::stdout().lock(),
+                broken_pipe: false,
+            };
+            match reader.read_file_to_writer(&path, &mut stdout) {
+                Ok(_) => {}
+                Err(_) if stdout.broken_pipe => return Ok(()),
+                Err(e) => return Err(format!("cat: {e}")),
+            }
+            match stdout.flush() {
+                Ok(()) => Ok(()),
+                Err(_) if stdout.broken_pipe => Ok(()),
+                Err(e) => Err(format!("flush: {e}")),
+            }
         }
         Commands::Verify {
             archive,

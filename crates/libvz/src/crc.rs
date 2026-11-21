@@ -436,13 +436,10 @@ pub fn crc32c_sw(data: &[u8]) -> u32 {
 #[inline]
 const fn gf2_matrix_times_const(mat: &[u32; 32], mut vec: u32) -> u32 {
     let mut sum = 0u32;
-    let mut idx = 0usize;
     while vec != 0 {
-        if (vec & 1) != 0 {
-            sum ^= mat[idx];
-        }
-        vec >>= 1;
-        idx += 1;
+        let idx = vec.trailing_zeros() as usize;
+        sum ^= mat[idx];
+        vec &= vec - 1;
     }
     sum
 }
@@ -458,38 +455,41 @@ const fn gf2_matrix_square_const(mat: &[u32; 32]) -> [u32; 32] {
     square
 }
 
+const fn build_shift_pow2_tables() -> [[u32; 32]; 64] {
+    let mut tables = [[0u32; 32]; 64];
+    let mut one_bit = [0u32; 32];
+    one_bit[0] = CRC32C_POLY_REFLECTED;
+    let mut row = 1u32;
+    let mut n = 1usize;
+    while n < 32 {
+        one_bit[n] = row;
+        row <<= 1;
+        n += 1;
+    }
+    let two_bits = gf2_matrix_square_const(&one_bit);
+    let four_bits = gf2_matrix_square_const(&two_bits);
+    tables[0] = gf2_matrix_square_const(&four_bits);
+    let mut b = 1usize;
+    while b < 64 {
+        tables[b] = gf2_matrix_square_const(&tables[b - 1]);
+        b += 1;
+    }
+    tables
+}
+
+const CRC32C_SHIFT_POW2: [[u32; 32]; 64] = build_shift_pow2_tables();
+
 /// Multiplies a CRC32C state `crc` by `x^(8 * len)` modulo the Castagnoli polynomial (`0x1EDC_6F41`).
 ///
 /// Equivalent to feeding `len` zero bytes through the CRC shift register without hashing them.
 pub const fn crc32c_shift_zeros(mut crc: u32, mut len: usize) -> u32 {
-    if len == 0 {
+    if len == 0 || crc == 0 {
         return crc;
     }
-    let mut odd = [0u32; 32];
-    odd[0] = CRC32C_POLY_REFLECTED;
-    let mut row = 1u32;
-    let mut n = 1usize;
-    while n < 32 {
-        odd[n] = row;
-        row <<= 1;
-        n += 1;
-    }
-    let mut even = gf2_matrix_square_const(&odd);
-    odd = gf2_matrix_square_const(&even);
     while len != 0 {
-        even = gf2_matrix_square_const(&odd);
-        if (len & 1) != 0 {
-            crc = gf2_matrix_times_const(&even, crc);
-        }
-        len >>= 1;
-        if len == 0 {
-            break;
-        }
-        odd = gf2_matrix_square_const(&even);
-        if (len & 1) != 0 {
-            crc = gf2_matrix_times_const(&odd, crc);
-        }
-        len >>= 1;
+        let bit = len.trailing_zeros() as usize;
+        crc = gf2_matrix_times_const(&CRC32C_SHIFT_POW2[bit], crc);
+        len &= len - 1;
     }
     crc
 }

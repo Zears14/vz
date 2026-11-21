@@ -188,7 +188,8 @@ pub struct VzWriter<W: Write + Seek> {
     owner_map: HashMap<(u32, u32, String, String), u8>,
     next_entry_id: u64,
     has_col_stats: bool,
-    last_parent: Option<(String, u64)>,
+    last_parent_path: String,
+    last_parent_hash: u64,
     compress_scratch: Vec<u8>,
     encrypt_scratch: Vec<u8>,
     read_scratch: Vec<u8>,
@@ -260,7 +261,8 @@ impl<W: Write + Seek> VzWriter<W> {
             owner_map,
             next_entry_id: 1,
             has_col_stats: false,
-            last_parent: None,
+            last_parent_path: String::new(),
+            last_parent_hash: 0,
             compress_scratch: Vec::new(),
             encrypt_scratch: Vec::new(),
             read_scratch: Vec::new(),
@@ -268,13 +270,13 @@ impl<W: Write + Seek> VzWriter<W> {
     }
 
     fn hash_parent_cached(&mut self, parent_path: &str) -> Result<u64, VzError> {
-        if let Some((ref cached_path, h)) = self.last_parent
-            && cached_path == parent_path
-        {
-            return Ok(h);
+        if !self.last_parent_path.is_empty() && self.last_parent_path == parent_path {
+            return Ok(self.last_parent_hash);
         }
         let h = self.hasher.hash(parent_path.as_bytes())?;
-        self.last_parent = Some((parent_path.to_string(), h));
+        self.last_parent_path.clear();
+        self.last_parent_path.push_str(parent_path);
+        self.last_parent_hash = h;
         Ok(h)
     }
 

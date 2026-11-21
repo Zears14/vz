@@ -382,7 +382,7 @@ fn build_gf256_affine_matrix(gf_coeff: u8) -> u64 {
         let mut row = 0u8;
         for (k, &col) in cols.iter().enumerate() {
             if ((col >> b) & 1) != 0 {
-                row |= 1u8 << (7 - k);
+                row |= 1u8 << k;
             }
         }
         mat[7 - b] = row;
@@ -1413,5 +1413,27 @@ mod tests {
             boot_ecc_verify_and_repair(&mut dual),
             Err(VzError::CorruptUnrecoverable)
         ));
+    }
+
+    #[test]
+    fn test_gf256_affine_matrix_matches_intel_sdm_all_256x256() {
+        assert_eq!(build_gf256_affine_matrix(0), 0);
+        assert_eq!(build_gf256_affine_matrix(1), 0x0102_0408_1020_4080);
+
+        for coeff in 0..=255u8 {
+            let mat_bytes = build_gf256_affine_matrix(coeff).to_le_bytes();
+            for x in 0..=255u8 {
+                let mut out = 0u8;
+                for i in 0..8usize {
+                    let parity = ((mat_bytes[7 - i] & x).count_ones() & 1) as u8;
+                    out |= parity << i;
+                }
+                assert_eq!(
+                    out,
+                    gf256_mul(x, coeff),
+                    "VGF2P8AFFINEQB matrix mismatch for coeff={coeff:#04x}, x={x:#04x}"
+                );
+            }
+        }
     }
 }

@@ -178,9 +178,9 @@ unsafe fn crc32c_update_x86_64_pclmul(crc: u32, data: &[u8]) -> u32 {
 #[target_feature(enable = "avx2,vpclmulqdq,sse4.2")]
 unsafe fn crc32c_update_x86_64_vpclmul_256(crc: u32, data: &[u8]) -> u32 {
     use core::arch::x86_64::{
-        __m256i, _mm256_castsi128_si256, _mm256_castsi256_si128, _mm256_clmulepi64_epi128,
-        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_set_epi64x, _mm256_xor_si256,
-        _mm_clmulepi64_si128, _mm_cvtsi32_si128, _mm_loadu_si128, _mm_set_epi64x, _mm_xor_si128,
+        __m256i, _mm256_castsi256_si128, _mm256_clmulepi64_epi128, _mm256_extracti128_si256,
+        _mm256_loadu_si256, _mm256_set_epi32, _mm256_set_epi64x, _mm256_xor_si256,
+        _mm_clmulepi64_si128, _mm_loadu_si128, _mm_set_epi64x, _mm_xor_si128,
     };
     if data.len() < 128 {
         // SAFETY: SSE4.2 is enabled by target_feature.
@@ -199,7 +199,7 @@ unsafe fn crc32c_update_x86_64_vpclmul_256(crc: u32, data: &[u8]) -> u32 {
         let mut rem = data.len();
 
         let mut y0 = _mm256_loadu_si256(ptr as *const __m256i);
-        y0 = _mm256_xor_si256(y0, _mm256_castsi128_si256(_mm_cvtsi32_si128(crc as i32)));
+        y0 = _mm256_xor_si256(y0, _mm256_set_epi32(0, 0, 0, 0, 0, 0, 0, crc as i32));
         let mut y1 = _mm256_loadu_si256(ptr.add(32) as *const __m256i);
         let mut y2 = _mm256_loadu_si256(ptr.add(64) as *const __m256i);
         let mut y3 = _mm256_loadu_si256(ptr.add(96) as *const __m256i);
@@ -267,9 +267,9 @@ unsafe fn crc32c_update_x86_64_vpclmul_256(crc: u32, data: &[u8]) -> u32 {
 #[target_feature(enable = "avx512f,vpclmulqdq,sse4.2")]
 unsafe fn crc32c_update_x86_64_vpclmul_512(crc: u32, data: &[u8]) -> u32 {
     use core::arch::x86_64::{
-        __m512i, _mm512_castsi128_si512, _mm512_castsi512_si128, _mm512_clmulepi64_epi128,
-        _mm512_extracti64x2_epi64, _mm512_loadu_si512, _mm512_set_epi64, _mm512_xor_si512,
-        _mm_clmulepi64_si128, _mm_cvtsi32_si128, _mm_loadu_si128, _mm_set_epi64x, _mm_xor_si128,
+        __m512i, _mm512_castsi512_si128, _mm512_clmulepi64_epi128, _mm512_extracti32x4_epi32,
+        _mm512_loadu_si512, _mm512_set_epi32, _mm512_set_epi64, _mm512_xor_si512,
+        _mm_clmulepi64_si128, _mm_loadu_si128, _mm_set_epi64x, _mm_xor_si128,
     };
     if data.len() < 256 {
         // SAFETY: SSE4.2 is enabled by target_feature.
@@ -294,7 +294,10 @@ unsafe fn crc32c_update_x86_64_vpclmul_512(crc: u32, data: &[u8]) -> u32 {
         let mut rem = data.len();
 
         let mut z0 = _mm512_loadu_si512(ptr as *const __m512i);
-        z0 = _mm512_xor_si512(z0, _mm512_castsi128_si512(_mm_cvtsi32_si128(crc as i32)));
+        z0 = _mm512_xor_si512(
+            z0,
+            _mm512_set_epi32(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, crc as i32),
+        );
         let mut z1 = _mm512_loadu_si512(ptr.add(64) as *const __m512i);
         let mut z2 = _mm512_loadu_si512(ptr.add(128) as *const __m512i);
         let mut z3 = _mm512_loadu_si512(ptr.add(192) as *const __m512i);
@@ -332,9 +335,9 @@ unsafe fn crc32c_update_x86_64_vpclmul_512(crc: u32, data: &[u8]) -> u32 {
         }
 
         let l0 = _mm512_castsi512_si128(acc512);
-        let l1 = _mm512_extracti64x2_epi64::<1>(acc512);
-        let l2 = _mm512_extracti64x2_epi64::<2>(acc512);
-        let l3 = _mm512_extracti64x2_epi64::<3>(acc512);
+        let l1 = _mm512_extracti32x4_epi32::<1>(acc512);
+        let l2 = _mm512_extracti32x4_epi32::<2>(acc512);
+        let l3 = _mm512_extracti32x4_epi32::<3>(acc512);
         let fold128 = |acc: core::arch::x86_64::__m128i, next: core::arch::x86_64::__m128i| {
             let lo = _mm_clmulepi64_si128::<0x00>(acc, k16);
             let hi = _mm_clmulepi64_si128::<0x11>(acc, k16);

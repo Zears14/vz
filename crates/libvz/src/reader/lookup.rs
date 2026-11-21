@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use super::{
-    CachedNode, DirEntryRef, LookupTarget, NodeRef, ResolvedEntry, VzReader, VzStat,
+    CachedNode, DirEntryRef, FastHasher, LookupTarget, NodeRef, ResolvedEntry, VzReader, VzStat,
     parse_dir_node_body, read_cluster_at,
 };
 use crate::btree::{LeafNodeView, RouteTableView, validate_cluster};
@@ -232,7 +233,7 @@ impl<R: RangeReader> VzReader<R> {
     pub fn list_all_live(&self) -> Result<Vec<ResolvedEntry>, VzError> {
         if self.lsm_runs.len() == 1 {
             let mut items = self.collect_all_in_run_raw(&self.lsm_runs[0])?;
-            Self::resolve_missing_dir_parents(&*self.hasher, std::slice::from_mut(&mut items))?;
+            Self::resolve_missing_dir_parents(&self.hasher, std::slice::from_mut(&mut items))?;
             items.retain(|e| !e.dir_entry.is_tombstone());
             return Ok(items);
         }
@@ -247,7 +248,7 @@ impl<R: RangeReader> VzReader<R> {
             runs_rev.push(r);
         }
 
-        Self::resolve_missing_dir_parents(&*self.hasher, &mut runs_rev)?;
+        Self::resolve_missing_dir_parents(&self.hasher, &mut runs_rev)?;
 
         let mut seen: HashSet<(u64, String, String)> = HashSet::with_capacity(total_est);
         let mut out = Vec::with_capacity(total_est);
@@ -271,7 +272,7 @@ impl<R: RangeReader> VzReader<R> {
     }
 
     fn resolve_missing_dir_parents(
-        hasher: &dyn crate::hash::PathHasher,
+        hasher: &FastHasher,
         runs: &mut [Vec<ResolvedEntry>],
     ) -> Result<(), VzError> {
         if !runs
@@ -448,6 +449,23 @@ impl<R: RangeReader> VzReader<R> {
         Ok(validated)
     }
 
+    #[inline]
+    fn parse_boot_leaf(&self, off: usize) -> Result<LeafNodeView<'_>, VzError> {
+        if off >= self.boot_block.len() {
+            return Err(VzError::BufferTooSmall);
+        }
+        let slice = &self.boot_block[off..];
+        if off != 0 && self.boot_root_verified.load(Ordering::Acquire) == off as u64 {
+            LeafNodeView::parse_trusted(slice)
+        } else {
+            let leaf = LeafNodeView::parse(slice)?;
+            if off != 0 {
+                self.boot_root_verified.store(off as u64, Ordering::Release);
+            }
+            Ok(leaf)
+        }
+    }
+
     pub(super) fn resolve_target(&self, path: &str) -> Result<LookupTarget, VzError> {
         let (parent_path, basename) = split_archive_path_borrowed(path)?;
         let parent_hash = self.hasher.hash(parent_path.as_bytes())?;
@@ -567,11 +585,7 @@ impl<R: RangeReader> VzReader<R> {
                     return Ok(None);
                 } else {
                     let off = usize::try_from(cur_off).map_err(|_| VzError::ValueOverflow)?;
-                    if off >= self.boot_block.len() {
-                        return Err(VzError::BufferTooSmall);
-                    }
-                    // Boot Block already passed HeaderSlot CRC32C + Boot ECC on open.
-                    let leaf = LeafNodeView::parse_trusted(&self.boot_block[off..])?;
+                    let leaf = self.parse_boot_leaf(off)?;
                     if let Some(de) = leaf.lookup_raw_exact(
                         parent_hash,
                         name_hash,
@@ -630,23 +644,14 @@ impl<R: RangeReader> VzReader<R> {
         loop {
             if cur_height == 0 {
                 let leaf_owned: Arc<CachedNode>;
-                let leaf_slice: &[u8] = if cur_is_cluster {
+                let leaf = if cur_is_cluster {
                     leaf_owned = self.read_cluster_node_cached(cur_off, cur_cluster_len)?;
-                    &leaf_owned.payload
+                    LeafNodeView::parse_trusted(&leaf_owned.payload)?
                 } else if let Some((_, _, ref pipe_bytes)) = self.pipe_root {
-                    pipe_bytes.as_slice()
+                    LeafNodeView::parse(pipe_bytes.as_slice())?
                 } else {
                     let off = usize::try_from(cur_off).map_err(|_| VzError::ValueOverflow)?;
-                    if off >= self.boot_block.len() {
-                        return Err(VzError::BufferTooSmall);
-                    }
-                    &self.boot_block[off..]
-                };
-
-                let leaf = if cur_is_cluster || self.pipe_root.is_some() {
-                    LeafNodeView::parse_trusted(leaf_slice)?
-                } else {
-                    LeafNodeView::parse(leaf_slice)?
+                    self.parse_boot_leaf(off)?
                 };
                 if let Some(de) = leaf.lookup_raw_exact(
                     parent_hash,
@@ -755,7 +760,7 @@ impl<R: RangeReader> VzReader<R> {
         if node.height == 0 {
             if !node.is_cluster && self.pipe_root.is_none() {
                 let off = usize::try_from(node.off).map_err(|_| VzError::ValueOverflow)?;
-                let leaf = LeafNodeView::parse_trusted(&self.boot_block[off..])?;
+                let leaf = self.parse_boot_leaf(off)?;
                 return visitor(&leaf);
             }
             if node.is_cluster {
@@ -868,7 +873,7 @@ impl<R: RangeReader> VzReader<R> {
         if node.height == 0 {
             if !node.is_cluster && self.pipe_root.is_none() {
                 let off = usize::try_from(node.off).map_err(|_| VzError::ValueOverflow)?;
-                let leaf = LeafNodeView::parse(&self.boot_block[off..])?;
+                let leaf = self.parse_boot_leaf(off)?;
                 return visitor(&leaf);
             }
             if node.is_cluster {

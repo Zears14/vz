@@ -79,6 +79,33 @@ pub fn boot_ecc_encode(boot_block: &mut [u8]) -> Result<(), VzError> {
     Ok(())
 }
 
+/// Verifies whether a 64 KiB Boot Block passes all Boot ECC checks cleanly without mutating or
+/// allocating (`true` = zero corruption detected; `false` = missing, corrupt, or needs repair).
+pub fn boot_ecc_verify_clean(boot_block: &[u8]) -> bool {
+    if boot_block.len() < DEFAULT_BOOT_SIZE {
+        return false;
+    }
+    let ecc_zone = &boot_block[..DEFAULT_BOOT_SIZE];
+    let desc_slice = &ecc_zone[BOOT_ECC_DESC_OFF..BOOT_ECC_DESC_OFF + BootEccDescriptor::SIZE];
+    let Ok(desc) = BootEccDescriptor::from_bytes(desc_slice) else {
+        return false;
+    };
+    if desc.ecc_magic != MAGIC_BOOT_ECC
+        || desc.protected_pages != BOOT_DATA_PAGES as u16
+        || desc.ecc_scheme != 1
+        || desc.reserved != 0
+        || crc32c(&desc_slice[..76]) != desc.desc_crc32c
+    {
+        return false;
+    }
+    for p in 0..BOOT_DATA_PAGES {
+        if boot_page_crc32c(ecc_zone, p) != Ok(desc.page_crc32c[p]) {
+            return false;
+        }
+    }
+    crc32c(&ecc_zone[BOOT_PARITY_OFFSET..DEFAULT_BOOT_SIZE]) == desc.page_crc32c[15]
+}
+
 /// Verifies a 64 KiB Boot Block and repairs any single corrupted 4 KiB page (`0..=15`) in-place.
 ///
 /// Returns `Ok(None)` if clean, `Ok(Some(page_idx))` if a single page was repaired, or

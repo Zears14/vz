@@ -9,24 +9,26 @@ pub use verify_repair::{
 pub(super) use verify_repair::{parse_dir_node_body, read_cluster_at, read_tail_cluster};
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 
 use crate::btree::validate_cluster;
 use crate::codec::{CryptoContext, EncryptionKey, ZstdDictCache};
-use crate::ecc::boot_ecc_verify_and_repair;
+use crate::crc::hash64;
+use crate::ecc::{boot_ecc_verify_and_repair, boot_ecc_verify_clean};
 use crate::error::VzError;
 use crate::ext_meta::{
     CipherHeader, DictEntry, ExtCodecMeta, LsmRunDesc, OwnerEntry, RawTlv, SchemaEntry,
     SparseExtent, Xattr, decode_dict_table, decode_lsm_runs, decode_owner_table,
     decode_root_fallback, decode_schema_table,
 };
-use crate::hash::{AlgoHasher, PathHasher};
+use crate::hash::PathHasher;
 use crate::io::RangeReader;
 use crate::wire::{
-    BootHeader, COMPAT_BOOT_ECC, ClusterFooter, DEFAULT_BOOT_SIZE, DirEntry, ExtTime, HeaderSlot,
-    INCOMPAT_BIG_BOOT, INCOMPAT_ENCRYPTED, RO_COMPAT_LSM_RUNS, TAG_CIPHER_HEADER,
-    TAG_DICT_TABLE, TAG_LSM_RUNS, TAG_NOP, TAG_OWNER_TABLE, TAG_ROOT_FALLBACK, TAG_SCHEMA_TABLE,
-    TREE_HEIGHT_PIPE, TlvIter,
+    BootHeader, COMPAT_BOOT_ECC, ClusterFooter, DEFAULT_BOOT_SIZE, DirEntry, ExtTime,
+    HASH_ALGO_BUILTIN, HeaderSlot, INCOMPAT_BIG_BOOT, INCOMPAT_ENCRYPTED, RO_COMPAT_LSM_RUNS,
+    TAG_CIPHER_HEADER, TAG_DICT_TABLE, TAG_LSM_RUNS, TAG_NOP, TAG_OWNER_TABLE, TAG_ROOT_FALLBACK,
+    TAG_SCHEMA_TABLE, TREE_HEIGHT_PIPE, TlvIter,
 };
 
 pub(super) const SUPPORTED_INCOMPAT: u16 = INCOMPAT_ENCRYPTED | INCOMPAT_BIG_BOOT;
@@ -142,12 +144,53 @@ pub(super) struct LookupTarget {
     pub(super) sparse_extents: Option<Vec<SparseExtent>>,
 }
 
+pub(super) enum FastHasher {
+    Builtin,
+    #[cfg(feature = "hashes")]
+    Xxh3,
+    #[cfg(feature = "hashes")]
+    Blake3,
+    Custom(Box<dyn PathHasher>),
+}
+
+impl FastHasher {
+    pub(super) fn from_algo(algo_id: u8) -> Result<Self, VzError> {
+        match algo_id {
+            HASH_ALGO_BUILTIN => Ok(Self::Builtin),
+            #[cfg(feature = "hashes")]
+            crate::wire::HASH_ALGO_XXH3_64 => Ok(Self::Xxh3),
+            #[cfg(feature = "hashes")]
+            crate::wire::HASH_ALGO_BLAKE3 => Ok(Self::Blake3),
+            _ => Err(VzError::Unsupported),
+        }
+    }
+
+    #[inline]
+    pub(super) fn hash(&self, data: &[u8]) -> Result<u64, VzError> {
+        match self {
+            Self::Builtin => Ok(hash64(data)),
+            #[cfg(feature = "hashes")]
+            Self::Xxh3 => Ok(xxhash_rust::xxh3::xxh3_64(data)),
+            #[cfg(feature = "hashes")]
+            Self::Blake3 => {
+                let digest = blake3::hash(data);
+                let bytes = digest.as_bytes();
+                Ok(u64::from_le_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                ]))
+            }
+            Self::Custom(h) => h.hash(data),
+        }
+    }
+}
+
 /// Random-access, HTTP-Range-friendly `.vz` reader.
 pub struct VzReader<R: RangeReader> {
     pub(super) reader: R,
     pub(super) boot_block: Vec<u8>,
+    pub(super) boot_root_verified: AtomicU64,
     pub(super) active_slot: HeaderSlot,
-    pub(super) hasher: Box<dyn PathHasher>,
+    pub(super) hasher: FastHasher,
     pub(super) owners: Vec<OwnerEntry>,
     pub(super) dicts: Vec<DictEntry>,
     pub(super) dict_cache: ZstdDictCache,
@@ -199,11 +242,12 @@ impl<R: RangeReader> VzReader<R> {
             .ok()
             .and_then(|h| h.select_active(0xFFFF).ok().map(|(s, _)| *s));
 
-        // Attempt Boot ECC verify-and-repair when enabled (or when BootHeader itself is damaged).
+        // Attempt Boot ECC verify-and-repair when enabled (avoiding 64 KiB clone when already clean).
         if opts.repair_boot_ecc
             && (pre_active.is_none()
                 || pre_active
                     .is_some_and(|s| (s.compat_flags & COMPAT_BOOT_ECC) != 0 && s.boot_block_size as usize == DEFAULT_BOOT_SIZE))
+            && !boot_ecc_verify_clean(&boot_block)
         {
             let mut candidate = boot_block.clone();
             if boot_ecc_verify_and_repair(&mut candidate).is_ok() {
@@ -271,9 +315,9 @@ impl<R: RangeReader> VzReader<R> {
             None
         };
 
-        let hasher: Box<dyn PathHasher> = match custom_hasher {
-            Some(h) => h,
-            None => Box::new(AlgoHasher::new(active_slot.hash_algo)?),
+        let hasher = match custom_hasher {
+            Some(h) => FastHasher::Custom(h),
+            None => FastHasher::from_algo(active_slot.hash_algo)?,
         };
 
         let mut pipe_root = None;
@@ -329,6 +373,7 @@ impl<R: RangeReader> VzReader<R> {
         Ok(Self {
             reader,
             boot_block,
+            boot_root_verified: AtomicU64::new(0),
             active_slot,
             hasher,
             owners,

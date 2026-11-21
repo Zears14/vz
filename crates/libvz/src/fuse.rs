@@ -123,13 +123,57 @@ enum PayloadSource {
     },
 }
 
+#[derive(Clone, Copy)]
+struct ChildEntry {
+    prefix: u64,
+    name_off: u32,
+    name_len: u32,
+    ino: u64,
+}
+
+#[inline]
+fn name_prefix_u64(name: &str) -> u64 {
+    let b = name.as_bytes();
+    let mut arr = [0u8; 8];
+    let take = b.len().min(8);
+    arr[..take].copy_from_slice(&b[..take]);
+    u64::from_be_bytes(arr)
+}
+
+impl ChildEntry {
+    #[inline]
+    fn name<'a>(&self, arena: &'a str) -> &'a str {
+        let start = self.name_off as usize;
+        let end = start + self.name_len as usize;
+        &arena[start..end]
+    }
+}
+
 struct InodeNode {
     attr: FuseAttr,
     parent_ino: u64,
-    /// Sorted by basename for `O(log child_count)` binary search on `lookup()`.
-    children: Vec<(String, u64)>,
+    /// Single contiguous UTF-8 arena storing all child basenames in this directory.
+    child_names: String,
+    /// Sorted by `(prefix, basename)` for cache-local `O(log child_count)` binary search on `lookup()`.
+    children: Vec<ChildEntry>,
     xattrs: Vec<Xattr>,
     payload: PayloadSource,
+}
+
+impl InodeNode {
+    #[inline]
+    fn push_child(&mut self, name: &str, ino: u64) {
+        if let (Ok(off), Ok(len)) = (u32::try_from(self.child_names.len()), u32::try_from(name.len()))
+        {
+            self.child_names.push_str(name);
+            self.children.push(ChildEntry {
+                prefix: name_prefix_u64(name),
+                name_off: off,
+                name_len: len,
+                ino,
+            });
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -242,6 +286,7 @@ impl<R: RangeReader> FuseVolume<R> {
                 blksize: 65_536,
             },
             parent_ino: FUSE_ROOT_ID,
+            child_names: String::new(),
             children: Vec::new(),
             xattrs: Vec::new(),
             payload: PayloadSource::None,
@@ -300,13 +345,12 @@ impl<R: RangeReader> FuseVolume<R> {
                         blksize: 65_536,
                     },
                     parent_ino,
+                    child_names: String::new(),
                     children: Vec::new(),
                     xattrs: Vec::new(),
                     payload: PayloadSource::None,
                 });
-                nodes[(parent_ino - 1) as usize]
-                    .children
-                    .push((entry.stat.name.clone(), new_ino));
+                nodes[(parent_ino - 1) as usize].push_child(&entry.stat.name, new_ino);
                 dir_path_to_ino.insert(full_dir, new_ino);
                 new_ino
             };
@@ -339,9 +383,7 @@ impl<R: RangeReader> FuseVolume<R> {
             {
                 nodes[(shared_ino - 1) as usize].attr.nlink =
                     nodes[(shared_ino - 1) as usize].attr.nlink.saturating_add(1);
-                nodes[(parent_ino - 1) as usize]
-                    .children
-                    .push((name, shared_ino));
+                nodes[(parent_ino - 1) as usize].push_child(&name, shared_ino);
                 continue;
             }
 
@@ -404,13 +446,12 @@ impl<R: RangeReader> FuseVolume<R> {
             nodes.push(InodeNode {
                 attr,
                 parent_ino,
+                child_names: String::new(),
                 children: Vec::new(),
                 xattrs: entry.stat.xattrs,
                 payload,
             });
-            nodes[(parent_ino - 1) as usize]
-                .children
-                .push((name, new_ino));
+            nodes[(parent_ino - 1) as usize].push_child(&name, new_ino);
         }
 
         // Compute exact POSIX `nlink` for directories (`2 + subdir count`) and sort child tables.
@@ -424,8 +465,14 @@ impl<R: RangeReader> FuseVolume<R> {
         for (idx, n) in nodes.iter_mut().enumerate() {
             if n.attr.kind == FuseFileKind::Directory {
                 n.attr.nlink = dir_nlinks[idx];
-                n.children.sort_by(|a, b| a.0.cmp(&b.0));
-                n.children.dedup_by(|a, b| a.0 == b.0);
+                let arena = n.child_names.as_str();
+                n.children.sort_by(|a, b| {
+                    a.prefix
+                        .cmp(&b.prefix)
+                        .then_with(|| a.name(arena).cmp(b.name(arena)))
+                });
+                n.children
+                    .dedup_by(|a, b| a.prefix == b.prefix && a.name(arena) == b.name(arena));
             }
         }
 
@@ -467,11 +514,18 @@ impl<R: RangeReader> FuseVolume<R> {
         if name == ".." {
             return self.getattr(parent.parent_ino);
         }
+        let target_prefix = name_prefix_u64(name);
+        let arena = parent.child_names.as_str();
         let idx = parent
             .children
-            .binary_search_by(|(child_name, _)| child_name.as_str().cmp(name))
+            .binary_search_by(|entry| {
+                entry
+                    .prefix
+                    .cmp(&target_prefix)
+                    .then_with(|| entry.name(arena).cmp(name))
+            })
             .map_err(|_| VzError::NotFound)?;
-        let child_ino = parent.children[idx].1;
+        let child_ino = parent.children[idx].ino;
         self.getattr(child_ino)
     }
 
@@ -542,13 +596,13 @@ impl<R: RangeReader> FuseVolume<R> {
                     });
                 }
                 _ => {
-                    let (ref name, child_ino) = parent.children[pos - 2];
-                    let attr = self.getattr(child_ino)?;
+                    let entry = parent.children[pos - 2];
+                    let attr = self.getattr(entry.ino)?;
                     out.push(FuseDirEntryPlus {
-                        ino: child_ino,
+                        ino: entry.ino,
                         offset: next_off,
                         kind: attr.kind,
-                        name: name.clone(),
+                        name: entry.name(&parent.child_names).to_string(),
                         attr,
                     });
                 }
@@ -1019,13 +1073,12 @@ fn ensure_dir_chain(
                 blksize: 65_536,
             },
             parent_ino: cur_ino,
+            child_names: String::new(),
             children: Vec::new(),
             xattrs: Vec::new(),
             payload: PayloadSource::None,
         });
-        nodes[(cur_ino - 1) as usize]
-            .children
-            .push((seg.to_string(), new_ino));
+        nodes[(cur_ino - 1) as usize].push_child(seg, new_ino);
         dir_map.insert(cur_path.clone(), new_ino);
         cur_ino = new_ino;
     }

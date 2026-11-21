@@ -94,6 +94,7 @@ impl<'a> RouteTableView<'a> {
     /// Binary searches for the first route whose `max >= (parent_hash, name_hash)`.
     ///
     /// Pass `(parent_hash, 0)` to find the first child cluster for `readdir`.
+    #[inline]
     pub fn lower_bound(
         &self,
         parent_hash: u64,
@@ -102,21 +103,25 @@ impl<'a> RouteTableView<'a> {
         if self.count == 0 {
             return Ok(None);
         }
-        let mut lo = 0usize;
-        let mut hi = self.count;
-        while lo < hi {
-            let mid = lo + ((hi - lo) >> 1);
-            let r = self.get(mid)?;
-            if key128_cmp(r.max_parent_hash, r.max_name_hash, parent_hash, name_hash)
-                == Ordering::Less
-            {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
+        let mut base = 0usize;
+        let mut size = self.count;
+        while size > 1 {
+            let half = size >> 1;
+            let mid = base + half;
+            let off = mid * RouteEntry::SIZE;
+            let mp = read_le_u64(self.bytes, off + 16);
+            let mn = read_le_u64(self.bytes, off + 24);
+            let less = (mp < parent_hash) | ((mp == parent_hash) & (mn < name_hash));
+            base = if less { mid } else { base };
+            size -= half;
         }
-        if lo < self.count {
-            Ok(Some((lo, self.get(lo)?)))
+        let off = base * RouteEntry::SIZE;
+        let mp = read_le_u64(self.bytes, off + 16);
+        let mn = read_le_u64(self.bytes, off + 24);
+        let less = (mp < parent_hash) | ((mp == parent_hash) & (mn < name_hash));
+        let idx = base + usize::from(less);
+        if idx < self.count {
+            Ok(Some((idx, self.get(idx)?)))
         } else {
             Ok(None)
         }
@@ -224,22 +229,29 @@ impl<'a> LeafNodeView<'a> {
     /// Returns the first entry index in `0..=entry_count()` with key `>= (parent_hash, name_hash)`.
     ///
     /// Pass `(parent_hash, 0)` to locate the start of a directory for `readdir`.
+    #[inline]
     pub fn lower_bound(&self, parent_hash: u64, name_hash: u64) -> Result<usize, VzError> {
         let count = self.entry_count();
-        let mut lo = 0usize;
-        let mut hi = count;
-        while lo < hi {
-            let mid = lo + ((hi - lo) >> 1);
+        if count == 0 {
+            return Ok(0);
+        }
+        let mut base = 0usize;
+        let mut size = count;
+        while size > 1 {
+            let half = size >> 1;
+            let mid = base + half;
             let off = mid * DirEntry::SIZE;
             let p_hash = read_le_u64(self.entries_bytes, off);
             let n_hash = read_le_u64(self.entries_bytes, off + 8);
-            if key128_cmp(p_hash, n_hash, parent_hash, name_hash) == Ordering::Less {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
+            let less = (p_hash < parent_hash) | ((p_hash == parent_hash) & (n_hash < name_hash));
+            base = if less { mid } else { base };
+            size -= half;
         }
-        Ok(lo)
+        let off = base * DirEntry::SIZE;
+        let p_hash = read_le_u64(self.entries_bytes, off);
+        let n_hash = read_le_u64(self.entries_bytes, off + 8);
+        let less = (p_hash < parent_hash) | ((p_hash == parent_hash) & (n_hash < name_hash));
+        Ok(base + usize::from(less))
     }
 
     /// Binary searches this leaf for `(parent_hash, name_hash)`, verifying both `exact_basename`
@@ -256,10 +268,13 @@ impl<'a> LeafNodeView<'a> {
         let count = self.entry_count();
         let mut idx = self.lower_bound(parent_hash, name_hash)?;
         while idx < count {
-            let e = self.entry(idx)?;
-            if e.parent_hash != parent_hash || e.name_hash != name_hash {
+            let off = idx * DirEntry::SIZE;
+            let p_hash = read_le_u64(self.entries_bytes, off);
+            let n_hash = read_le_u64(self.entries_bytes, off + 8);
+            if p_hash != parent_hash || n_hash != name_hash {
                 break;
             }
+            let e = DirEntry::from_bytes(&self.entries_bytes[off..off + DirEntry::SIZE])?;
             if let Some(target_name) = exact_basename {
                 match e.entry_name(self.name_pool) {
                     Ok(stored) if stored == target_name => {}
@@ -271,6 +286,7 @@ impl<'a> LeafNodeView<'a> {
                 }
             }
             if let Some(target_parent) = exact_parent_path
+                && e.has_hash_collision()
                 && let Some(stored_parent) = e.entry_parent_path(self.ext_meta_pool)?
                 && stored_parent != target_parent
             {
@@ -359,6 +375,86 @@ impl<'a, 'v> Iterator for LeafDirIter<'a, 'v> {
             Err(err) => {
                 self.idx = self.view.entry_count();
                 Some(Err(err))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wire::{CODEC_NONE, DirPayload, FLAG_INLINE_DATA, KIND_REG, LeafNodeHeader, write_le_u64};
+
+    #[test]
+    fn test_branchless_lower_bound_exhaustive_with_duplicates() {
+        let mut route_buf = [0u8; 65 * RouteEntry::SIZE];
+        let mut leaf_buf = [0u8; LeafNodeHeader::SIZE + 65 * DirEntry::SIZE];
+
+        for n in 0usize..=65 {
+            let mut keys = Vec::with_capacity(n);
+            for i in 0..n {
+                // Inject duplicates every ~3 entries and span multiple parent_hash groups.
+                let p = (i / 7) as u64 * 10 + 10;
+                let k = ((i % 7) / 2) as u64 * 10 + 5;
+                keys.push((p, k));
+
+                let r = RouteEntry {
+                    min_parent_hash: p,
+                    min_name_hash: k,
+                    max_parent_hash: p,
+                    max_name_hash: k,
+                    child_cluster_off: 0x10000 + (i as u64) * 64,
+                    child_cluster_len: 4096,
+                    subtree_count_lo: 1,
+                };
+                r.write_bytes(&mut route_buf[i * RouteEntry::SIZE..(i + 1) * RouteEntry::SIZE])
+                    .unwrap();
+
+                let off = LeafNodeHeader::SIZE + i * DirEntry::SIZE;
+                let de = DirEntry {
+                    parent_hash: p,
+                    name_hash: k,
+                    payload: DirPayload::Inline {
+                        bytes: [0u8; 27],
+                        len: 0,
+                    },
+                    entry_id_lo: i as u32,
+                    mtime_ns: 0,
+                    name_pool_off: 0,
+                    ext_meta_off: 0,
+                    posix_mode: KIND_REG | 0o644,
+                    owner_idx: 0,
+                    flags_and_codec: CODEC_NONE | FLAG_INLINE_DATA,
+                };
+                de.write_bytes(&mut leaf_buf[off..off + DirEntry::SIZE]).unwrap();
+                write_le_u64(&mut leaf_buf, off, p);
+                write_le_u64(&mut leaf_buf, off + 8, k);
+            }
+
+            let hdr = LeafNodeHeader {
+                entry_count: n as u32,
+                name_pool_len: 0,
+                ext_meta_len: 0,
+                node_crc32c: 0,
+            };
+            hdr.write_bytes(&mut leaf_buf[..LeafNodeHeader::SIZE]).unwrap();
+
+            let rtable = RouteTableView::new(&route_buf[..n * RouteEntry::SIZE], n).unwrap();
+            let leaf = LeafNodeView::parse_trusted(&leaf_buf).unwrap();
+
+            for qp in [0u64, 5, 10, 15, 20, 30, 100, 1000] {
+                for qn in [0u64, 5, 10, 15, 25, 35, 100] {
+                    let expected = keys
+                        .iter()
+                        .position(|&(p, k)| (p, k) >= (qp, qn))
+                        .unwrap_or(n);
+                    let got_leaf = leaf.lower_bound(qp, qn).unwrap();
+                    assert_eq!(got_leaf, expected, "leaf n={n} q=({qp},{qn})");
+
+                    let got_route = rtable.lower_bound(qp, qn).unwrap().map(|(i, _)| i);
+                    let exp_route = if expected < n { Some(expected) } else { None };
+                    assert_eq!(got_route, exp_route, "route n={n} q=({qp},{qn})");
+                }
             }
         }
     }

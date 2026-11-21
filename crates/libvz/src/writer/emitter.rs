@@ -236,6 +236,7 @@ impl<W: Write> ClusterEmitter<W> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn append_manifest_prefix_into(
         buf: &mut Vec<u8>,
         body_start: usize,

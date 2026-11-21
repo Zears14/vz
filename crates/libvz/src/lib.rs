@@ -30,6 +30,8 @@ pub mod ext_meta;
 #[cfg(feature = "std")]
 pub mod fuse;
 #[cfg(feature = "std")]
+mod parallel;
+#[cfg(feature = "std")]
 pub mod reader;
 #[cfg(feature = "std")]
 pub mod rs;

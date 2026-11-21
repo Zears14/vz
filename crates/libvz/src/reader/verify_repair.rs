@@ -457,7 +457,7 @@ pub fn verify_archive<R: RangeReader>(
                 crate::parallel::adaptive_workers(
                     spans.len(),
                     total_u.saturating_sub(boot_end as usize),
-                    4 * 1024 * 1024,
+                    1024 * 1024,
                 )
             } else {
                 1
@@ -498,46 +498,39 @@ pub fn verify_archive<R: RangeReader>(
                     stripes: Vec<u64>,
                     corrupt: bool,
                 }
-                let group_sz = spans.len().div_ceil(workers);
-                let grp_results: Vec<Result<VerifyChunkOut, VzError>> =
-                    std::thread::scope(|s| {
-                        let handles: Vec<_> = spans
-                            .chunks(group_sz)
-                            .map(|grp| {
-                                s.spawn(move || -> Result<VerifyChunkOut, VzError> {
-                                    let mut out = VerifyChunkOut::default();
-                                    for &(start, end) in grp {
-                                        match verify_cluster_single_pass(
-                                            &all[start..end],
-                                            start as u64,
-                                            &mut out.errs,
-                                            &mut out.stripes,
-                                        )? {
-                                            ClusterCheck::Ok(_) => {}
-                                            ClusterCheck::Corrupt(_) => {
-                                                return Ok(VerifyChunkOut {
-                                                    corrupt: true,
-                                                    ..Default::default()
-                                                });
-                                            }
-                                        }
-                                    }
-                                    out.checked = grp.len();
-                                    Ok(out)
-                                })
-                            })
-                            .collect();
-                        handles
-                            .into_iter()
-                            .map(|h| h.join().map_err(|_| VzError::IoError).and_then(|r| r))
-                            .collect()
-                    });
+                let target_groups = (workers * 2).min(spans.len()).max(workers);
+                let group_sz = spans.len().div_ceil(target_groups);
+                let span_groups: Vec<&[(usize, usize)]> = spans.chunks(group_sz).collect();
+                let grp_results = crate::parallel::par_try_map(
+                    span_groups,
+                    workers,
+                    |grp| -> Result<VerifyChunkOut, VzError> {
+                        let mut out = VerifyChunkOut::default();
+                        for &(start, end) in grp {
+                            match verify_cluster_single_pass(
+                                &all[start..end],
+                                start as u64,
+                                &mut out.errs,
+                                &mut out.stripes,
+                            )? {
+                                ClusterCheck::Ok(_) => {}
+                                ClusterCheck::Corrupt(_) => {
+                                    return Ok(VerifyChunkOut {
+                                        corrupt: true,
+                                        ..Default::default()
+                                    });
+                                }
+                            }
+                        }
+                        out.checked = grp.len();
+                        Ok(out)
+                    },
+                )?;
                 let mut all_ok = true;
                 let mut merged_checked = 0usize;
                 let mut merged_errs = Vec::new();
                 let mut merged_stripes = Vec::new();
-                for res in grp_results {
-                    let chunk_out = res?;
+                for chunk_out in grp_results {
                     if chunk_out.corrupt {
                         all_ok = false;
                         break;

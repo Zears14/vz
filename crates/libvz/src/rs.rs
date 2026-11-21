@@ -5,7 +5,7 @@ use crate::ecc::{
 };
 use crate::error::VzError;
 use crate::ext_meta::push_levint;
-use crate::parallel::adaptive_workers;
+use crate::parallel::{adaptive_workers, par_try_map};
 use crate::wire::{
     ClusterFooter, ClusterHeader, ECC_RAPTORQ, ECC_RS_GF256, ECC_RS_GF65536, MAGIC_CLUSTER,
     MAGIC_FOOTER, ParityManifest, TAG_PARITY_CLUSTER, TlvIter, read_le_u64, write_void_align64,
@@ -90,7 +90,8 @@ fn accumulate_tiled_gf256(
         return Ok(());
     }
     let num_tiles = len.div_ceil(RS_TILE_BYTES);
-    let workers = adaptive_workers(num_tiles, n_src.saturating_mul(len), 2 * 1024 * 1024);
+    let ops_bytes = n_src.saturating_mul(n_dst).saturating_mul(len);
+    let workers = adaptive_workers(num_tiles, ops_bytes, 1024 * 1024);
     if workers <= 1 {
         return accumulate_band(dst_payloads, 0, len, srcs, coeffs_row_major, n_dst);
     }
@@ -121,30 +122,9 @@ fn accumulate_tiled_gf256(
         return Ok(());
     }
 
-    let last = bands.pop();
-    let results: Vec<Result<(), VzError>> = std::thread::scope(|s| {
-        let handles: Vec<_> = bands
-            .into_iter()
-            .map(|(start, blen, mut slices)| {
-                s.spawn(move || accumulate_band(&mut slices, start, blen, srcs, coeffs_row_major, n_dst))
-            })
-            .collect();
-        let last_res = match last {
-            Some((start, blen, mut slices)) => {
-                accumulate_band(&mut slices, start, blen, srcs, coeffs_row_major, n_dst)
-            }
-            None => Ok(()),
-        };
-        let mut out = Vec::with_capacity(handles.len() + 1);
-        for h in handles {
-            out.push(h.join().unwrap_or(Err(VzError::IoError)));
-        }
-        out.push(last_res);
-        out
-    });
-    for r in results {
-        r?;
-    }
+    par_try_map(bands, workers, |(start, blen, mut slices)| {
+        accumulate_band(&mut slices, start, blen, srcs, coeffs_row_major, n_dst)
+    })?;
     Ok(())
 }
 
@@ -334,26 +314,13 @@ pub fn encode_rs_gf256_stripe(
         }
     } else {
         let chunk_sz = m.div_ceil(crc_workers);
-        let results: Vec<Result<(), VzError>> = std::thread::scope(|s| {
-            let handles: Vec<_> = parity_clusters
-                .chunks_mut(chunk_sz)
-                .map(|grp| {
-                    s.spawn(move || -> Result<(), VzError> {
-                        for cluster in grp {
-                            finalize_one(cluster)?;
-                        }
-                        Ok(())
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap_or(Err(VzError::IoError)))
-                .collect()
-        });
-        for r in results {
-            r?;
-        }
+        let groups: Vec<&mut [Vec<u8>]> = parity_clusters.chunks_mut(chunk_sz).collect();
+        par_try_map(groups, crc_workers, |grp| {
+            for cluster in grp {
+                finalize_one(cluster)?;
+            }
+            Ok(())
+        })?;
     }
 
     Ok((parity_clusters, total_len as u64))
@@ -480,26 +447,13 @@ pub fn recover_rs_gf256_stripe(
         }
     } else {
         let chunk_sz = missing_count.div_ceil(val_workers);
-        let results: Vec<Result<(), VzError>> = std::thread::scope(|s| {
-            let handles: Vec<_> = recovered_bufs
-                .chunks_mut(chunk_sz)
-                .map(|grp| {
-                    s.spawn(move || -> Result<(), VzError> {
-                        for buf in grp {
-                            validate_one(buf)?;
-                        }
-                        Ok(())
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap_or(Err(VzError::IoError)))
-                .collect()
-        });
-        for r in results {
-            r?;
-        }
+        let groups: Vec<&mut [Vec<u8>]> = recovered_bufs.chunks_mut(chunk_sz).collect();
+        par_try_map(groups, val_workers, |grp| {
+            for buf in grp {
+                validate_one(buf)?;
+            }
+            Ok(())
+        })?;
     }
 
     for (idx, bytes) in missing_indices.into_iter().zip(recovered_bufs) {

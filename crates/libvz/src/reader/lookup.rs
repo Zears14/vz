@@ -452,19 +452,28 @@ impl<R: RangeReader> VzReader<R> {
         Ok(max_id)
     }
 
-    /// Resolves raw entry (including tombstones) for `path` in `self.lsm_runs`, newest-first.
-    pub(crate) fn resolve_raw_for_append(&self, path: &str) -> Result<Option<ResolvedEntry>, VzError> {
-        let (parent_path, basename) = split_archive_path(path)?;
-        let parent_hash = self.hasher.hash(parent_path.as_bytes())?;
-        let name_hash = self.hasher.hash(basename.as_bytes())?;
+    /// Checks whether `(parent_path, basename)` with precomputed `(parent_hash, name_hash)`
+    /// resolves to a live (non-tombstone) entry in `self.lsm_runs`, newest-first, with zero
+    /// string/stat allocation.
+    pub(crate) fn is_live_by_hashes_for_append(
+        &self,
+        parent_path: &str,
+        basename: &str,
+        parent_hash: u64,
+        name_hash: u64,
+    ) -> Result<bool, VzError> {
         for run in self.lsm_runs.iter().rev() {
-            if let Some(res) =
-                self.lookup_in_run(run, &parent_path, &basename, parent_hash, name_hash)?
-            {
-                return Ok(Some(res));
+            if let Some(target) = self.lookup_target_in_run(
+                run,
+                parent_path,
+                basename,
+                parent_hash,
+                name_hash,
+            )? {
+                return Ok(!target.dir_entry.is_tombstone());
             }
         }
-        Ok(None)
+        Ok(false)
     }
 
     /// Resolves a live entry for `path`, checking runs newest-to-oldest.

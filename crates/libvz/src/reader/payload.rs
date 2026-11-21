@@ -253,6 +253,27 @@ impl<R: RangeReader> VzReader<R> {
             return Err(VzError::BadFormat);
         }
 
+        if self.crypto.is_none() && codec == crate::wire::CODEC_NONE && ext_codec.is_none() {
+            out.clear();
+            out.reserve(total_raw);
+            for ext in &extents {
+                let slen = usize::try_from(ext.stored_size).map_err(|_| VzError::ValueOverflow)?;
+                let rlen = usize::try_from(ext.raw_size).map_err(|_| VzError::ValueOverflow)?;
+                if slen != rlen {
+                    return Err(VzError::BadFormat);
+                }
+                let p_off = ext
+                    .cluster_offset
+                    .checked_add(ext.in_cluster_offset as u64)
+                    .and_then(|v| usize::try_from(v).ok())
+                    .ok_or(VzError::ValueOverflow)?;
+                let p_end = p_off.checked_add(slen).ok_or(VzError::ValueOverflow)?;
+                let stored = all.get(p_off..p_end).ok_or(VzError::BufferTooSmall)?;
+                out.extend_from_slice(stored);
+            }
+            return Ok(());
+        }
+
         if out.is_empty() && out.capacity() < total_raw {
             *out = vec![0u8; total_raw];
         } else {
@@ -865,62 +886,199 @@ impl<R: RangeReader> VzReader<R> {
         }
 
         let contig = self.reader.contiguous_bytes();
+        let clusters_vec: Vec<(u64, Vec<usize>)> = by_cluster.into_iter().collect();
+        let mut comp_clusters = 0usize;
+        let mut comp_bytes = 0usize;
+        for (_, idxs) in &clusters_vec {
+            let mut cluster_has_work = false;
+            for &idx in idxs {
+                let entry = &live[idx];
+                if self.crypto.is_some()
+                    || entry.dir_entry.codec() != crate::wire::CODEC_NONE
+                    || entry.ext_codec.is_some()
+                {
+                    cluster_has_work = true;
+                    if let DirPayload::Ref { raw_size, .. } = entry.dir_entry.payload {
+                        comp_bytes = comp_bytes.saturating_add(raw_size as usize);
+                    }
+                }
+            }
+            if cluster_has_work {
+                comp_clusters += 1;
+            }
+        }
+        let n_workers = adaptive_workers(comp_clusters, comp_bytes, 512 * 1024);
+
         let mut cluster_buf = Vec::new();
         let mut decrypt_buf = Vec::new();
         let mut out_buf = Vec::new();
 
-        for (cluster_off, idxs) in by_cluster {
-            let (chdr, cluster_slice) =
-                Self::load_validated_cluster(&self.reader, contig, cluster_off, &mut cluster_buf)?;
-            for idx in idxs {
-                let entry = &live[idx];
-                let DirPayload::Ref {
-                    stored_size,
-                    raw_size,
-                    in_cluster_offset,
-                    ..
-                } = entry.dir_entry.payload
-                else {
-                    return Err(VzError::BadFormat);
-                };
-                let slen = usize::try_from(stored_size).map_err(|_| VzError::ValueOverflow)?;
-                let rlen = usize::try_from(raw_size).map_err(|_| VzError::ValueOverflow)?;
-                let ioff = in_cluster_offset as usize;
-                let end = ioff.checked_add(slen).ok_or(VzError::ValueOverflow)?;
-                let stored_slice = cluster_slice.get(ioff..end).ok_or(VzError::BufferTooSmall)?;
+        if n_workers > 1
+            && let Some(all) = contig
+        {
+            struct DecodedClusterBatch {
+                arena: Vec<u8>,
+                ranges: Vec<(usize, usize)>,
+            }
+            let live_ref = &live;
+            let crypto = self.crypto.as_ref();
+            let dicts = &self.dicts;
+            let dict_cache = &self.dict_cache;
+            let decoded_batches = crate::parallel::par_try_map(
+                clusters_vec.iter().collect(),
+                n_workers,
+                |&(cluster_off, ref idxs): &(u64, Vec<usize>)| -> Result<DecodedClusterBatch, VzError> {
+                    let mut d_buf = Vec::new();
+                    let off_u =
+                        usize::try_from(cluster_off).map_err(|_| VzError::ValueOverflow)?;
+                    let hdr = ClusterHeader::from_bytes(
+                        all.get(off_u..).ok_or(VzError::BufferTooSmall)?,
+                    )?;
+                    let clen =
+                        usize::try_from(hdr.cluster_len).map_err(|_| VzError::ValueOverflow)?;
+                    let c_end = off_u.checked_add(clen).ok_or(VzError::ValueOverflow)?;
+                    let cluster_slice = all.get(off_u..c_end).ok_or(VzError::BufferTooSmall)?;
+                    let (chdr, _, _) = validate_cluster(cluster_slice)?;
+                    let total_raw: usize = idxs
+                        .iter()
+                        .map(|&i| match live_ref[i].dir_entry.payload {
+                            DirPayload::Ref { raw_size, .. } => raw_size as usize,
+                            _ => 0,
+                        })
+                        .sum();
+                    let mut arena = vec![0u8; total_raw];
+                    let mut ranges = Vec::with_capacity(idxs.len());
+                    let mut pos = 0usize;
+                    for &idx in idxs {
+                        let entry = &live_ref[idx];
+                        let DirPayload::Ref {
+                            stored_size,
+                            raw_size,
+                            in_cluster_offset,
+                            ..
+                        } = entry.dir_entry.payload
+                        else {
+                            return Err(VzError::BadFormat);
+                        };
+                        let slen =
+                            usize::try_from(stored_size).map_err(|_| VzError::ValueOverflow)?;
+                        let rlen =
+                            usize::try_from(raw_size).map_err(|_| VzError::ValueOverflow)?;
+                        let ioff = in_cluster_offset as usize;
+                        let end = ioff.checked_add(slen).ok_or(VzError::ValueOverflow)?;
+                        let stored_slice =
+                            cluster_slice.get(ioff..end).ok_or(VzError::BufferTooSmall)?;
+                        let dst = &mut arena[pos..pos + rlen];
+                        let codec = entry.dir_entry.codec();
+                        let ext_codec = entry.ext_codec.as_ref();
+                        if let Some(ctx) = crypto {
+                            ctx.decrypt_payload_into(
+                                entry.run_generation,
+                                chdr.cluster_seq,
+                                entry.stat.entry_id,
+                                stored_slice,
+                                &mut d_buf,
+                            )?;
+                            decompress_payload_into_slice(
+                                &d_buf,
+                                dst,
+                                codec,
+                                ext_codec,
+                                dicts,
+                                Some(dict_cache),
+                            )?;
+                        } else {
+                            decompress_payload_into_slice(
+                                stored_slice,
+                                dst,
+                                codec,
+                                ext_codec,
+                                dicts,
+                                Some(dict_cache),
+                            )?;
+                        }
+                        ranges.push((pos, pos + rlen));
+                        pos += rlen;
+                    }
+                    Ok(DecodedClusterBatch { arena, ranges })
+                },
+            )?;
 
-                if out_buf.len() < rlen {
-                    out_buf.resize(rlen, 0);
+            for ((_, idxs), batch) in clusters_vec.iter().zip(decoded_batches.iter()) {
+                for (&idx, &(s, e)) in idxs.iter().zip(batch.ranges.iter()) {
+                    visitor(&live[idx], &batch.arena[s..e])?;
                 }
-                let codec = entry.dir_entry.codec();
-                let ext_codec = entry.ext_codec.as_ref();
-                if let Some(ref ctx) = self.crypto {
-                    ctx.decrypt_payload_into(
-                        entry.run_generation,
-                        chdr.cluster_seq,
-                        entry.stat.entry_id,
-                        stored_slice,
-                        &mut decrypt_buf,
-                    )?;
-                    decompress_payload_into_slice(
-                        &decrypt_buf,
-                        &mut out_buf[..rlen],
-                        codec,
-                        ext_codec,
-                        &self.dicts,
-                        Some(&self.dict_cache),
-                    )?;
-                } else {
-                    decompress_payload_into_slice(
-                        stored_slice,
-                        &mut out_buf[..rlen],
-                        codec,
-                        ext_codec,
-                        &self.dicts,
-                        Some(&self.dict_cache),
-                    )?;
+            }
+        } else {
+            for (cluster_off, idxs) in clusters_vec {
+                let (chdr, cluster_slice) = Self::load_validated_cluster(
+                    &self.reader,
+                    contig,
+                    cluster_off,
+                    &mut cluster_buf,
+                )?;
+                for idx in idxs {
+                    let entry = &live[idx];
+                    let DirPayload::Ref {
+                        stored_size,
+                        raw_size,
+                        in_cluster_offset,
+                        ..
+                    } = entry.dir_entry.payload
+                    else {
+                        return Err(VzError::BadFormat);
+                    };
+                    let slen = usize::try_from(stored_size).map_err(|_| VzError::ValueOverflow)?;
+                    let rlen = usize::try_from(raw_size).map_err(|_| VzError::ValueOverflow)?;
+                    let ioff = in_cluster_offset as usize;
+                    let end = ioff.checked_add(slen).ok_or(VzError::ValueOverflow)?;
+                    let stored_slice =
+                        cluster_slice.get(ioff..end).ok_or(VzError::BufferTooSmall)?;
+
+                    let codec = entry.dir_entry.codec();
+                    let ext_codec = entry.ext_codec.as_ref();
+                    if self.crypto.is_none()
+                        && codec == crate::wire::CODEC_NONE
+                        && ext_codec.is_none()
+                    {
+                        if slen != rlen {
+                            return Err(VzError::BadFormat);
+                        }
+                        visitor(entry, stored_slice)?;
+                        continue;
+                    }
+
+                    if out_buf.len() < rlen {
+                        out_buf.resize(rlen, 0);
+                    }
+                    if let Some(ref ctx) = self.crypto {
+                        ctx.decrypt_payload_into(
+                            entry.run_generation,
+                            chdr.cluster_seq,
+                            entry.stat.entry_id,
+                            stored_slice,
+                            &mut decrypt_buf,
+                        )?;
+                        decompress_payload_into_slice(
+                            &decrypt_buf,
+                            &mut out_buf[..rlen],
+                            codec,
+                            ext_codec,
+                            &self.dicts,
+                            Some(&self.dict_cache),
+                        )?;
+                    } else {
+                        decompress_payload_into_slice(
+                            stored_slice,
+                            &mut out_buf[..rlen],
+                            codec,
+                            ext_codec,
+                            &self.dicts,
+                            Some(&self.dict_cache),
+                        )?;
+                    }
+                    visitor(entry, &out_buf[..rlen])?;
                 }
-                visitor(entry, &out_buf[..rlen])?;
             }
         }
 

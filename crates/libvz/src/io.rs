@@ -238,3 +238,184 @@ impl RangeReader for MmapRangeReader {
         Some(self.as_slice())
     }
 }
+
+#[cfg(feature = "std")]
+static NEXT_SHARD_SLOT: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    static SHARD_SLOT: core::cell::Cell<Option<usize>> = const { core::cell::Cell::new(None) };
+}
+
+/// Multi-fd [`RangeReader`] opening independent kernel file descriptors per shard to eliminate
+/// shared `struct file::f_count` atomic contention during high-concurrency `pread` workloads.
+#[cfg(feature = "std")]
+#[derive(Debug)]
+pub struct ShardedFileReader {
+    #[cfg(unix)]
+    shards: Box<[std::fs::File]>,
+    #[cfg(not(unix))]
+    shards: Box<[std::sync::Mutex<std::fs::File>]>,
+}
+
+#[cfg(feature = "std")]
+impl ShardedFileReader {
+    /// Opens `path` using a default shard count sized to CPU parallelism (`1..=32`).
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, VzError> {
+        let count = crate::parallel::cached_parallelism().clamp(1, 32);
+        Self::open_with_shards(path, count)
+    }
+
+    /// Opens `path` using `shards` independent file descriptors (`shards >= 1`).
+    pub fn open_with_shards(
+        path: impl AsRef<std::path::Path>,
+        shards: usize,
+    ) -> Result<Self, VzError> {
+        let target = shards.max(1);
+        let path_ref = path.as_ref();
+        #[cfg(unix)]
+        let mut opened = Vec::with_capacity(target);
+        #[cfg(not(unix))]
+        let mut opened = Vec::with_capacity(target);
+        for i in 0..target {
+            match std::fs::File::open(path_ref) {
+                Ok(f) => {
+                    #[cfg(unix)]
+                    opened.push(f);
+                    #[cfg(not(unix))]
+                    opened.push(std::sync::Mutex::new(f));
+                }
+                Err(_) if i > 0 => break,
+                Err(_) => return Err(VzError::IoError),
+            }
+        }
+        Ok(Self {
+            shards: opened.into_boxed_slice(),
+        })
+    }
+
+    /// Returns the active number of file descriptor shards.
+    #[inline]
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    #[inline]
+    fn thread_shard_idx(&self) -> usize {
+        let slot = SHARD_SLOT
+            .try_with(|cell| match cell.get() {
+                Some(id) => id,
+                None => {
+                    let id = NEXT_SHARD_SLOT.fetch_add(1, Ordering::Relaxed);
+                    cell.set(Some(id));
+                    id
+                }
+            })
+            .unwrap_or(0);
+        slot % self.shards.len()
+    }
+}
+
+#[cfg(feature = "std")]
+impl RangeReader for ShardedFileReader {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), VzError> {
+        let idx = self.thread_shard_idx();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.shards[idx]
+                .read_exact_at(buf, offset)
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::UnexpectedEof => VzError::BufferTooSmall,
+                    _ => VzError::IoError,
+                })
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut guard = self.shards[idx].lock().map_err(|_| VzError::IoError)?;
+            guard
+                .seek(SeekFrom::Start(offset))
+                .map_err(|_| VzError::IoError)?;
+            guard.read_exact(buf).map_err(|e| match e.kind() {
+                std::io::ErrorKind::UnexpectedEof => VzError::BufferTooSmall,
+                _ => VzError::IoError,
+            })
+        }
+    }
+
+    fn total_len(&self) -> Result<u64, VzError> {
+        #[cfg(unix)]
+        {
+            self.shards[0]
+                .metadata()
+                .map(|m| m.len())
+                .map_err(|_| VzError::IoError)
+        }
+        #[cfg(not(unix))]
+        {
+            let guard = self.shards[0].lock().map_err(|_| VzError::IoError)?;
+            guard
+                .metadata()
+                .map(|m| m.len())
+                .map_err(|_| VzError::IoError)
+        }
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::reader::VzReader;
+    use crate::writer::{VzWriter, VzWriterConfig};
+
+    #[test]
+    fn test_sharded_file_reader_concurrent_and_eof() {
+        let tf = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut w = VzWriter::new(tf.reopen().unwrap(), VzWriterConfig::default()).unwrap();
+            for i in 0..200usize {
+                w.add_file(
+                    &format!("/s/{:02}/f_{i:04}.bin", i % 10),
+                    format!("payload-{i:04}-data-padding-over-inline-threshold").as_bytes(),
+                )
+                .unwrap();
+            }
+            w.finish().unwrap();
+        }
+
+        let sharded = ShardedFileReader::open_with_shards(tf.path(), 4).unwrap();
+        assert_eq!(sharded.shard_count(), 4);
+        let len = sharded.total_len().unwrap();
+        assert!(len > 0);
+        let mut eof_buf = [0u8; 16];
+        assert_eq!(
+            sharded.read_at(len.saturating_sub(4), &mut eof_buf),
+            Err(VzError::BufferTooSmall)
+        );
+
+        let reader = Arc::new(VzReader::open(sharded).unwrap());
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8usize)
+                .map(|tid| {
+                    let r = Arc::clone(&reader);
+                    s.spawn(move || {
+                        let mut scratch = Vec::new();
+                        for step in 0..50usize {
+                            let i = (tid * 17 + step) % 200;
+                            let path = format!("/s/{:02}/f_{i:04}.bin", i % 10);
+                            r.read_file_into(&path, &mut scratch).unwrap();
+                            let exp = format!("payload-{i:04}-data-padding-over-inline-threshold");
+                            assert_eq!(scratch.as_slice(), exp.as_bytes());
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
+    }
+}

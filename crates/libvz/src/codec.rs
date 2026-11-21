@@ -164,8 +164,19 @@ fn resolve_decompress_codec(
     }
 }
 
-/// Decompresses `stored` directly into caller-owned `out` buffer (clearing `out` first),
-/// avoiding repeated buffer allocations during bulk sequential extraction.
+/// Resizes `out` to `target_len` for immediate full-buffer overwrite without pre-clearing
+/// existing length `[0..old_len]`, avoiding redundant full-buffer zeroing on reused scratch buffers.
+#[inline]
+pub(crate) fn resize_for_overwrite(out: &mut Vec<u8>, target_len: usize) {
+    if out.len() < target_len {
+        out.resize(target_len, 0);
+    } else {
+        out.truncate(target_len);
+    }
+}
+
+/// Decompresses `stored` directly into caller-owned `out` buffer, avoiding full-buffer pre-zeroing
+/// on reused scratch buffers and clearing `out` on error.
 pub fn decompress_payload_into(
     stored: &[u8],
     out: &mut Vec<u8>,
@@ -175,16 +186,32 @@ pub fn decompress_payload_into(
     dicts: &[DictEntry],
     cache: Option<&ZstdDictCache>,
 ) -> Result<(), VzError> {
-    out.clear();
-    match resolve_decompress_codec(codec, ext_codec)? {
-        ResolvedCodec::None => {
+    match resolve_decompress_codec(codec, ext_codec) {
+        Ok(ResolvedCodec::None) => {
+            out.clear();
             out.extend_from_slice(stored);
             Ok(())
         }
-        ResolvedCodec::Lz4 => decompress_lz4_into(stored, out, raw_size),
-        ResolvedCodec::Zstd => decompress_zstd_into(stored, out, raw_size),
-        ResolvedCodec::ZstdDict(dict_id) => {
-            decompress_zstd_dict_into(stored, out, raw_size, dict_id, dicts, cache)
+        Ok(ResolvedCodec::Lz4) => decompress_lz4_into(stored, out, raw_size),
+        Ok(ResolvedCodec::Zstd) => {
+            out.clear();
+            let res = decompress_zstd_into(stored, out, raw_size);
+            if res.is_err() {
+                out.clear();
+            }
+            res
+        }
+        Ok(ResolvedCodec::ZstdDict(dict_id)) => {
+            out.clear();
+            let res = decompress_zstd_dict_into(stored, out, raw_size, dict_id, dicts, cache);
+            if res.is_err() {
+                out.clear();
+            }
+            res
+        }
+        Err(e) => {
+            out.clear();
+            Err(e)
         }
     }
 }
@@ -413,9 +440,9 @@ fn match_lz4_single_block_fast(stored: &[u8]) -> Option<Lz4FastBlock<'_>> {
 fn decompress_lz4_into(stored: &[u8], out: &mut Vec<u8>, raw_size: usize) -> Result<(), VzError> {
     use std::io::Read;
     if let Some(fast) = match_lz4_single_block_fast(stored) {
-        out.clear();
         match fast {
             Lz4FastBlock::EmptyFrame => {
+                out.clear();
                 return if raw_size == 0 {
                     Ok(())
                 } else {
@@ -423,6 +450,7 @@ fn decompress_lz4_into(stored: &[u8], out: &mut Vec<u8>, raw_size: usize) -> Res
                 };
             }
             Lz4FastBlock::Uncompressed(blk) => {
+                out.clear();
                 if blk.len() != raw_size {
                     return Err(VzError::CompressionError);
                 }
@@ -430,10 +458,16 @@ fn decompress_lz4_into(stored: &[u8], out: &mut Vec<u8>, raw_size: usize) -> Res
                 return Ok(());
             }
             Lz4FastBlock::Compressed(blk) => {
-                out.resize(raw_size, 0);
-                let n = lz4_flex::block::decompress_into(blk, out)
-                    .map_err(|_| VzError::CompressionError)?;
+                resize_for_overwrite(out, raw_size);
+                let n = match lz4_flex::block::decompress_into(blk, out) {
+                    Ok(n) => n,
+                    Err(_) => {
+                        out.clear();
+                        return Err(VzError::CompressionError);
+                    }
+                };
                 if n != raw_size {
+                    out.clear();
                     return Err(VzError::CompressionError);
                 }
                 return Ok(());
@@ -444,16 +478,16 @@ fn decompress_lz4_into(stored: &[u8], out: &mut Vec<u8>, raw_size: usize) -> Res
     out.clear();
     out.reserve(raw_size.min(4 * 1024 * 1024));
     let mut dec = lz4_flex::frame::FrameDecoder::new(stored);
-    dec.read_to_end(out)
-        .map_err(|_| VzError::CompressionError)?;
-    if out.len() != raw_size {
+    if dec.read_to_end(out).is_err() || out.len() != raw_size {
+        out.clear();
         return Err(VzError::CompressionError);
     }
     Ok(())
 }
 
 #[cfg(not(feature = "compression"))]
-fn decompress_lz4_into(_stored: &[u8], _out: &mut Vec<u8>, _raw_size: usize) -> Result<(), VzError> {
+fn decompress_lz4_into(_stored: &[u8], out: &mut Vec<u8>, _raw_size: usize) -> Result<(), VzError> {
+    out.clear();
     Err(VzError::Unsupported)
 }
 

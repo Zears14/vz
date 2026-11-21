@@ -3,10 +3,14 @@ use std::io::Write;
 
 use super::{LookupTarget, ResolvedEntry, VzReader, read_cluster_at};
 use crate::btree::validate_cluster;
-use crate::codec::{CryptoContext, ZstdDictCache, decompress_payload_into, decompress_payload_into_slice};
+use crate::codec::{
+    CryptoContext, ZstdDictCache, decompress_payload_into, decompress_payload_into_slice,
+    resize_for_overwrite,
+};
 use crate::error::VzError;
 use crate::ext_meta::{ChunkExtent, DictEntry, ExtCodecMeta, decode_chunk_table};
 use crate::io::RangeReader;
+use crate::parallel::{adaptive_workers, par_try_map};
 use crate::wire::{ClusterFooter, ClusterHeader, DirPayload, MAGIC_CLUSTER, TAG_CHUNK_TABLE};
 
 const READ_TLS_CAP: usize = 1_048_576;
@@ -123,13 +127,19 @@ impl<R: RangeReader> VzReader<R> {
         Ok(out)
     }
 
-    /// Reads and decodes the entire payload of `path` directly into `out` (clearing `out` first).
+    /// Reads and decodes the entire payload of `path` directly into `out` (reusing existing capacity).
     pub fn read_file_into(&self, path: &str, out: &mut Vec<u8>) -> Result<(), VzError> {
-        out.clear();
-        let target = self.resolve_target(path)?;
+        let target = match self.resolve_target(path) {
+            Ok(t) => t,
+            Err(e) => {
+                out.clear();
+                return Err(e);
+            }
+        };
         let de = &target.dir_entry;
 
         if let Some(inline) = de.inline_slice() {
+            out.clear();
             out.extend_from_slice(inline);
             return Ok(());
         }
@@ -141,6 +151,7 @@ impl<R: RangeReader> VzReader<R> {
             in_cluster_offset,
         } = de.payload
         else {
+            out.clear();
             return Err(VzError::BadFormat);
         };
 
@@ -180,11 +191,46 @@ impl<R: RangeReader> VzReader<R> {
         }
 
         // Sparse or non-contiguous multi-cluster path delegates cleanly to streaming writer.
-        self.decode_ref_to_writer(&target, out).map(|_| ())
+        out.clear();
+        if let Err(e) = self.decode_ref_to_writer(&target, out) {
+            out.clear();
+            return Err(e);
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
     fn read_multi_cluster_into(
+        &self,
+        all: &[u8],
+        data_offset: u64,
+        in_cluster_offset: u32,
+        raw_size: u64,
+        codec: u8,
+        ext_codec: Option<&ExtCodecMeta>,
+        generation: u64,
+        entry_id: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<(), VzError> {
+        let res = self.read_multi_cluster_into_inner(
+            all,
+            data_offset,
+            in_cluster_offset,
+            raw_size,
+            codec,
+            ext_codec,
+            generation,
+            entry_id,
+            out,
+        );
+        if res.is_err() {
+            out.clear();
+        }
+        res
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_multi_cluster_into_inner(
         &self,
         all: &[u8],
         data_offset: u64,
@@ -210,69 +256,108 @@ impl<R: RangeReader> VzReader<R> {
         if out.is_empty() && out.capacity() < total_raw {
             *out = vec![0u8; total_raw];
         } else {
-            out.resize(total_raw, 0);
+            resize_for_overwrite(out, total_raw);
         }
 
         let dicts = &self.dicts;
         let dict_cache = &self.dict_cache;
         let crypto = self.crypto.as_ref();
-        let decode_chunk =
-            |ext: &ChunkExtent, dst: &mut [u8], dec_scratch: &mut Vec<u8>| -> Result<(), VzError> {
-                let slen = usize::try_from(ext.stored_size).map_err(|_| VzError::ValueOverflow)?;
-                let p_off = ext
-                    .cluster_offset
-                    .checked_add(ext.in_cluster_offset as u64)
-                    .and_then(|v| usize::try_from(v).ok())
-                    .ok_or(VzError::ValueOverflow)?;
-                let p_end = p_off.checked_add(slen).ok_or(VzError::ValueOverflow)?;
-                let stored = all.get(p_off..p_end).ok_or(VzError::BufferTooSmall)?;
+        let decode_chunk = |ext: &ChunkExtent, dst: &mut [u8]| -> Result<(), VzError> {
+            let slen = usize::try_from(ext.stored_size).map_err(|_| VzError::ValueOverflow)?;
+            let p_off = ext
+                .cluster_offset
+                .checked_add(ext.in_cluster_offset as u64)
+                .and_then(|v| usize::try_from(v).ok())
+                .ok_or(VzError::ValueOverflow)?;
+            let p_end = p_off.checked_add(slen).ok_or(VzError::ValueOverflow)?;
+            let stored = all.get(p_off..p_end).ok_or(VzError::BufferTooSmall)?;
 
-                if let Some(ctx) = crypto {
-                    let c_off =
-                        usize::try_from(ext.cluster_offset).map_err(|_| VzError::ValueOverflow)?;
-                    let chdr = ClusterHeader::from_bytes(
-                        all.get(c_off..).ok_or(VzError::BufferTooSmall)?,
+            if let Some(ctx) = crypto {
+                let c_off =
+                    usize::try_from(ext.cluster_offset).map_err(|_| VzError::ValueOverflow)?;
+                let chdr =
+                    ClusterHeader::from_bytes(all.get(c_off..).ok_or(VzError::BufferTooSmall)?)?;
+                if chdr.sync_magic != MAGIC_CLUSTER {
+                    return Err(VzError::BadMagic);
+                }
+                if codec == crate::wire::CODEC_NONE && ext_codec.is_none() {
+                    ctx.decrypt_payload_into_slice(
+                        generation,
+                        chdr.cluster_seq,
+                        entry_id,
+                        stored,
+                        dst,
                     )?;
-                    if chdr.sync_magic != MAGIC_CLUSTER {
-                        return Err(VzError::BadMagic);
-                    }
-                    if codec == crate::wire::CODEC_NONE && ext_codec.is_none() {
-                        ctx.decrypt_payload_into_slice(
-                            generation,
-                            chdr.cluster_seq,
-                            entry_id,
-                            stored,
-                            dst,
-                        )?;
-                    } else {
+                } else {
+                    let tls_res = DEC_SCRATCH_TLS.try_with(|cell| -> Result<(), VzError> {
+                        let Ok(mut dec_scratch) = cell.try_borrow_mut() else {
+                            let decrypted = ctx.decrypt_payload(
+                                generation,
+                                chdr.cluster_seq,
+                                entry_id,
+                                stored,
+                            )?;
+                            return decompress_payload_into_slice(
+                                &decrypted,
+                                dst,
+                                codec,
+                                ext_codec,
+                                dicts,
+                                Some(dict_cache),
+                            );
+                        };
                         ctx.decrypt_payload_into(
                             generation,
                             chdr.cluster_seq,
                             entry_id,
                             stored,
-                            dec_scratch,
+                            &mut dec_scratch,
                         )?;
-                        decompress_payload_into_slice(
-                            dec_scratch,
+                        let dec_r = decompress_payload_into_slice(
+                            &dec_scratch,
                             dst,
                             codec,
                             ext_codec,
                             dicts,
                             Some(dict_cache),
-                        )?;
+                        );
+                        if dec_scratch.capacity() > 4 * 1024 * 1024 {
+                            *dec_scratch = Vec::new();
+                        }
+                        dec_r
+                    });
+                    match tls_res {
+                        Ok(r) => r?,
+                        Err(_) => {
+                            let decrypted = ctx.decrypt_payload(
+                                generation,
+                                chdr.cluster_seq,
+                                entry_id,
+                                stored,
+                            )?;
+                            decompress_payload_into_slice(
+                                &decrypted,
+                                dst,
+                                codec,
+                                ext_codec,
+                                dicts,
+                                Some(dict_cache),
+                            )?;
+                        }
                     }
-                } else {
-                    decompress_payload_into_slice(
-                        stored,
-                        dst,
-                        codec,
-                        ext_codec,
-                        dicts,
-                        Some(dict_cache),
-                    )?;
                 }
-                Ok(())
-            };
+            } else {
+                decompress_payload_into_slice(
+                    stored,
+                    dst,
+                    codec,
+                    ext_codec,
+                    dicts,
+                    Some(dict_cache),
+                )?;
+            }
+            Ok(())
+        };
 
         let min_bytes = if crypto.is_some()
             || (codec != crate::wire::CODEC_NONE && codec != crate::wire::CODEC_LZ4)
@@ -282,20 +367,25 @@ impl<R: RangeReader> VzReader<R> {
         } else {
             2 * 1024 * 1024
         };
-        let n_workers = crate::parallel::adaptive_workers(extents.len(), total_raw, min_bytes);
+        let n_workers = adaptive_workers(extents.len(), total_raw, min_bytes);
         if n_workers <= 1 {
             let mut off = 0usize;
-            let mut dec_scratch = Vec::new();
             for ext in &extents {
                 let rlen = ext.raw_size as usize;
-                decode_chunk(ext, &mut out[off..off + rlen], &mut dec_scratch)?;
+                decode_chunk(ext, &mut out[off..off + rlen])?;
                 off += rlen;
             }
             return Ok(());
         }
 
-        let group_sz = extents.len().div_ceil(n_workers);
-        let mut tasks: Vec<(&[ChunkExtent], &mut [u8])> = Vec::with_capacity(n_workers);
+        let target_bands = if extents.len() <= 64 {
+            extents.len()
+        } else {
+            n_workers.saturating_mul(2).min(extents.len())
+        }
+        .max(1);
+        let group_sz = extents.len().div_ceil(target_bands);
+        let mut tasks: Vec<(&[ChunkExtent], &mut [u8])> = Vec::with_capacity(target_bands);
         let mut rest_out = out.as_mut_slice();
         for ext_band in extents.chunks(group_sz) {
             let band_bytes: usize = ext_band.iter().map(|e| e.raw_size as usize).sum();
@@ -303,37 +393,16 @@ impl<R: RangeReader> VzReader<R> {
             tasks.push((ext_band, head));
             rest_out = tail;
         }
-        let last = tasks.pop();
-        let run_band = |ext_band: &[ChunkExtent], band_out: &mut [u8]| -> Result<(), VzError> {
+
+        par_try_map(tasks, n_workers, |(ext_band, band_out)| {
             let mut off = 0usize;
-            let mut dec_scratch = Vec::new();
             for ext in ext_band {
                 let rlen = ext.raw_size as usize;
-                decode_chunk(ext, &mut band_out[off..off + rlen], &mut dec_scratch)?;
+                decode_chunk(ext, &mut band_out[off..off + rlen])?;
                 off += rlen;
             }
             Ok(())
-        };
-
-        let results: Vec<Result<(), VzError>> = std::thread::scope(|s| {
-            let handles: Vec<_> = tasks
-                .into_iter()
-                .map(|(ext_band, band_out)| s.spawn(move || run_band(ext_band, band_out)))
-                .collect();
-            let last_res = match last {
-                Some((ext_band, band_out)) => run_band(ext_band, band_out),
-                None => Ok(()),
-            };
-            let mut res = Vec::with_capacity(handles.len() + 1);
-            for h in handles {
-                res.push(h.join().unwrap_or(Err(VzError::IoError)));
-            }
-            res.push(last_res);
-            res
-        });
-        for r in results {
-            r?;
-        }
+        })?;
         Ok(())
     }
 
@@ -1034,6 +1103,36 @@ impl<R: RangeReader> VzReader<R> {
         entry_id: u64,
         out: &mut Vec<u8>,
     ) -> Result<(), VzError> {
+        let res = self.read_single_cluster_payload_into_inner(
+            cluster_offset,
+            in_cluster_offset,
+            stored_size,
+            raw_size,
+            codec,
+            ext_codec,
+            generation,
+            entry_id,
+            out,
+        );
+        if res.is_err() {
+            out.clear();
+        }
+        res
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_single_cluster_payload_into_inner(
+        &self,
+        cluster_offset: u64,
+        in_cluster_offset: u32,
+        stored_size: u64,
+        raw_size: u64,
+        codec: u8,
+        ext_codec: Option<&ExtCodecMeta>,
+        generation: u64,
+        entry_id: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<(), VzError> {
         let slen = usize::try_from(stored_size).map_err(|_| VzError::ValueOverflow)?;
         let rlen = usize::try_from(raw_size).map_err(|_| VzError::ValueOverflow)?;
         let payload_off = cluster_offset
@@ -1139,7 +1238,7 @@ impl<R: RangeReader> VzReader<R> {
         }
 
         if codec == crate::wire::CODEC_NONE && ext_codec.is_none() {
-            out.resize(slen, 0);
+            resize_for_overwrite(out, slen);
             return self.reader.read_at(payload_off, out);
         }
 
@@ -1233,5 +1332,89 @@ impl<R: RangeReader> VzReader<R> {
             return Err(VzError::BadFormat);
         }
         decode_chunk_table(elem.value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+    use crate::wire::{CODEC_LZ4, CODEC_NONE, CODEC_ZSTD};
+    use crate::writer::{EntryOptions, VzWriter, VzWriterConfig};
+
+    #[cfg(feature = "compression")]
+    #[test]
+    fn test_read_file_into_dirty_scratch_and_error_clearing() {
+        let small = vec![0x11u8; 512];
+        let equal = vec![0x22u8; 2048];
+        let larger = vec![0x33u8; 8192];
+        let multi: Vec<u8> = (0..(150 * 1024)).map(|i| ((i * 7 + 3) & 0xFF) as u8).collect();
+
+        for &codec in &[CODEC_NONE, CODEC_LZ4, CODEC_ZSTD] {
+            let cfg = VzWriterConfig {
+                default_codec: codec,
+                target_cluster_size: 32 * 1024,
+                multi_cluster_threshold: 32 * 1024,
+                ..Default::default()
+            };
+            let mut w = VzWriter::new(Cursor::new(Vec::new()), cfg).unwrap();
+            w.add_file_with_options("/small.bin", &small, EntryOptions::default())
+                .unwrap();
+            w.add_file_with_options("/equal.bin", &equal, EntryOptions::default())
+                .unwrap();
+            w.add_file_with_options("/larger.bin", &larger, EntryOptions::default())
+                .unwrap();
+            w.add_file_with_options("/multi.bin", &multi, EntryOptions::default())
+                .unwrap();
+            let arc = w.finish().unwrap().into_inner();
+
+            let tf = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(tf.path(), &arc).unwrap();
+            let f_reader = VzReader::open(tf.reopen().unwrap()).unwrap();
+            let m_reader = VzReader::open(arc).unwrap();
+
+            for r_kind in [0u8, 1u8] {
+                let mut scratch = vec![0xFFu8; 2048];
+                if r_kind == 0 {
+                    f_reader.read_file_into("/smaller_missing", &mut scratch).unwrap_err();
+                    assert!(scratch.is_empty(), "error must leave dirty out empty");
+
+                    scratch = vec![0xEEu8; 4096];
+                    f_reader.read_file_into("/small.bin", &mut scratch).unwrap();
+                    assert_eq!(scratch, small);
+
+                    scratch = vec![0xDDu8; 2048];
+                    f_reader.read_file_into("/equal.bin", &mut scratch).unwrap();
+                    assert_eq!(scratch, equal);
+
+                    f_reader.read_file_into("/larger.bin", &mut scratch).unwrap();
+                    assert_eq!(scratch, larger);
+
+                    f_reader.read_file_into("/multi.bin", &mut scratch).unwrap();
+                    assert_eq!(scratch, multi);
+
+                    f_reader.read_file_into("/missing.bin", &mut scratch).unwrap_err();
+                    assert!(scratch.is_empty());
+                } else {
+                    scratch = vec![0xEEu8; 4096];
+                    m_reader.read_file_into("/small.bin", &mut scratch).unwrap();
+                    assert_eq!(scratch, small);
+
+                    scratch = vec![0xDDu8; 2048];
+                    m_reader.read_file_into("/equal.bin", &mut scratch).unwrap();
+                    assert_eq!(scratch, equal);
+
+                    m_reader.read_file_into("/larger.bin", &mut scratch).unwrap();
+                    assert_eq!(scratch, larger);
+
+                    m_reader.read_file_into("/multi.bin", &mut scratch).unwrap();
+                    assert_eq!(scratch, multi);
+
+                    m_reader.read_file_into("/missing.bin", &mut scratch).unwrap_err();
+                    assert!(scratch.is_empty());
+                }
+            }
+        }
     }
 }

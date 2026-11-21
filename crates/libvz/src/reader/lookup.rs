@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -9,24 +8,102 @@ use super::{
     VerifiedSlice, VzReader, VzStat, parse_dir_node_body, read_cluster_at,
 };
 
-const MMAP_L1_SLOTS: usize = 64;
-const BUF_L1_SLOTS: usize = 16;
-const BUF_L1_MAX_PAYLOAD: usize = 8192;
+const MMAP_L1_SETS: usize = 64;
+const BUF_L1_SETS: usize = 64;
+const BUF_L1_MAX_PAYLOAD: usize = 256 * 1024;
 
-type BufL1Slot = Option<(u64, u64, Rc<CachedNode>)>;
+type MmapL1Entry = (u64, u64, VerifiedSlice);
+type BufL1Entry = Option<(u64, u64, Arc<CachedNode>)>;
+
+const EMPTY_MMAP_L1_ENTRY: MmapL1Entry = (
+    0,
+    0,
+    VerifiedSlice {
+        start: 0,
+        len: 0,
+        entry_count: 0,
+    },
+);
+
+struct MmapL1Cache {
+    entries: [[MmapL1Entry; 2]; MMAP_L1_SETS],
+    rr_bits: u64,
+}
+
+impl MmapL1Cache {
+    const fn new() -> Self {
+        Self {
+            entries: [[EMPTY_MMAP_L1_ENTRY; 2]; MMAP_L1_SETS],
+            rr_bits: 0,
+        }
+    }
+
+    #[inline]
+    fn get(&self, set_idx: usize, tag: u64, offset: u64) -> Option<VerifiedSlice> {
+        for &(e_tag, e_off, vs) in &self.entries[set_idx] {
+            if e_tag == tag && e_off == offset {
+                return Some(vs);
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn insert(&mut self, set_idx: usize, tag: u64, offset: u64, vs: VerifiedSlice) {
+        for (w, slot) in self.entries[set_idx].iter().enumerate() {
+            if slot.0 == 0 || slot.0 != tag || slot.1 == offset {
+                self.entries[set_idx][w] = (tag, offset, vs);
+                return;
+            }
+        }
+        let way = ((self.rr_bits >> set_idx) & 1) as usize;
+        self.rr_bits ^= 1u64 << set_idx;
+        self.entries[set_idx][way] = (tag, offset, vs);
+    }
+}
+
+struct BufL1Cache {
+    entries: [[BufL1Entry; 2]; BUF_L1_SETS],
+    rr_bits: u64,
+}
+
+impl BufL1Cache {
+    const fn new() -> Self {
+        Self {
+            entries: [const { [None, None] }; BUF_L1_SETS],
+            rr_bits: 0,
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, set_idx: usize, tag: u64, offset: u64, node: Arc<CachedNode>) {
+        for (w, slot) in self.entries[set_idx].iter().enumerate() {
+            match slot {
+                None => {
+                    self.entries[set_idx][w] = Some((tag, offset, node));
+                    return;
+                }
+                Some((e_tag, e_off, _)) if *e_tag != tag || *e_off == offset => {
+                    self.entries[set_idx][w] = Some((tag, offset, node));
+                    return;
+                }
+                _ => {}
+            }
+        }
+        let way = ((self.rr_bits >> set_idx) & 1) as usize;
+        self.rr_bits ^= 1u64 << set_idx;
+        self.entries[set_idx][way] = Some((tag, offset, node));
+    }
+}
 
 std::thread_local! {
-    static MMAP_NODE_L1: RefCell<[(u64, u64, VerifiedSlice); MMAP_L1_SLOTS]> = const {
-        RefCell::new([(0, 0, VerifiedSlice { start: 0, len: 0, entry_count: 0 }); MMAP_L1_SLOTS])
-    };
-    static BUF_NODE_L1: RefCell<[BufL1Slot; BUF_L1_SLOTS]> = const {
-        RefCell::new([const { None }; BUF_L1_SLOTS])
-    };
+    static MMAP_NODE_L1: RefCell<MmapL1Cache> = const { RefCell::new(MmapL1Cache::new()) };
+    static BUF_NODE_L1: RefCell<BufL1Cache> = const { RefCell::new(BufL1Cache::new()) };
 }
 
 #[inline]
-fn node_l1_slot(offset: u64, len: usize) -> usize {
-    ((offset >> 6).wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize) & (len - 1)
+fn node_l1_slot(offset: u64, sets: usize) -> usize {
+    ((offset >> 6).wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize) & (sets - 1)
 }
 use crate::btree::{LeafNodeView, RouteTableView, validate_cluster};
 use crate::error::VzError;
@@ -419,18 +496,13 @@ impl<R: RangeReader> VzReader<R> {
         match &self.node_cache {
             NodeCache::Contiguous { shards, mask } => {
                 let all = self.reader.contiguous_bytes().ok_or(VzError::BadFormat)?;
-                let l1_idx = node_l1_slot(offset, MMAP_L1_SLOTS);
+                let l1_idx = node_l1_slot(offset, MMAP_L1_SETS);
                 let l1_hit = MMAP_NODE_L1
                     .try_with(|cell| {
-                        let Ok(arr) = cell.try_borrow() else {
+                        let Ok(cache) = cell.try_borrow() else {
                             return None;
                         };
-                        let (e_tag, e_off, vs) = arr[l1_idx];
-                        if e_tag == tag && e_off == offset {
-                            Some(vs)
-                        } else {
-                            None
-                        }
+                        cache.get(l1_idx, tag, offset)
                     })
                     .ok()
                     .flatten();
@@ -491,8 +563,8 @@ impl<R: RangeReader> VzReader<R> {
 
                 if self.cache_tag.load(Ordering::Acquire) == tag {
                     let _ = MMAP_NODE_L1.try_with(|cell| {
-                        if let Ok(mut arr) = cell.try_borrow_mut() {
-                            arr[l1_idx] = (tag, offset, vs);
+                        if let Ok(mut cache) = cell.try_borrow_mut() {
+                            cache.insert(l1_idx, tag, offset, vs);
                         }
                     });
                 }
@@ -502,26 +574,30 @@ impl<R: RangeReader> VzReader<R> {
                 f(slice, vs.entry_count)
             }
             NodeCache::Buffered { shards, mask } => {
-                let l1_idx = node_l1_slot(offset, BUF_L1_SLOTS);
-                let l1_hit = BUF_NODE_L1
-                    .try_with(|cell| {
-                        let Ok(arr) = cell.try_borrow() else {
-                            return None;
-                        };
-                        if let Some((e_tag, e_off, ref rc_node)) = arr[l1_idx]
-                            && e_tag == tag
-                            && e_off == offset
-                        {
-                            Some(Rc::clone(rc_node))
-                        } else {
-                            None
+                let l1_idx = node_l1_slot(offset, BUF_L1_SETS);
+                let mut f_opt = Some(f);
+                let l1_res = BUF_NODE_L1
+                    .try_with(|cell| -> Option<Result<T, VzError>> {
+                        let cache = cell.try_borrow().ok()?;
+                        for slot in &cache.entries[l1_idx] {
+                            if let Some((e_tag, e_off, arc_node)) = slot
+                                && *e_tag == tag
+                                && *e_off == offset
+                            {
+                                let func = f_opt.take()?;
+                                return Some(func(&arc_node.payload, arc_node.entry_count));
+                            }
                         }
+                        None
                     })
                     .ok()
                     .flatten();
-                if let Some(rc_node) = l1_hit {
-                    return f(&rc_node.payload, rc_node.entry_count);
+                if let Some(res) = l1_res {
+                    return res;
                 }
+                let Some(func) = f_opt.take() else {
+                    return Err(VzError::IoError);
+                };
 
                 let s_idx = NodeCache::shard_idx(offset, *mask);
                 let mut arc_opt = None;
@@ -560,19 +636,12 @@ impl<R: RangeReader> VzReader<R> {
                     && self.cache_tag.load(Ordering::Acquire) == tag
                 {
                     let _ = BUF_NODE_L1.try_with(|cell| {
-                        if let Ok(mut arr) = cell.try_borrow_mut() {
-                            arr[l1_idx] = Some((
-                                tag,
-                                offset,
-                                Rc::new(CachedNode {
-                                    entry_count: node.entry_count,
-                                    payload: node.payload.clone(),
-                                }),
-                            ));
+                        if let Ok(mut cache) = cell.try_borrow_mut() {
+                            cache.insert(l1_idx, tag, offset, Arc::clone(&node));
                         }
                     });
                 }
-                f(&node.payload, node.entry_count)
+                func(&node.payload, node.entry_count)
             }
         }
     }
@@ -1178,5 +1247,89 @@ impl<R: RangeReader> VzReader<R> {
             extra_ext_tlvs,
         })
     }
+}
 
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+    use crate::io::CountingRangeReader;
+    use crate::writer::{VzWriter, VzWriterConfig};
+
+    #[test]
+    fn test_buffered_large_leaf_l1_cache_invalidate_and_reentrant_readdir_visit() {
+        let cfg = VzWriterConfig {
+            max_leaf_entries: 256,
+            max_route_entries: 64,
+            ..Default::default()
+        };
+        let mut w = VzWriter::new(Cursor::new(Vec::new()), cfg).unwrap();
+        let n_files = 600usize;
+        let mut paths = Vec::with_capacity(n_files);
+        for i in 0..n_files {
+            let p = format!(
+                "/dir_{:02}/very_long_entry_filename_padding_to_exceed_8k_leaf_{i:04}_payload_tag.bin",
+                i % 4
+            );
+            let data = format!("content-{i:04}").into_bytes();
+            w.add_file(&p, &data).unwrap();
+            paths.push((p, data));
+        }
+        let arc = w.finish().unwrap().into_inner();
+
+        let counting = CountingRangeReader::new(arc.as_slice());
+        let reader = VzReader::open(counting).unwrap();
+        assert!(
+            reader.active_slot().tree_height >= 1,
+            "expected multi-level tree with clustered leaves"
+        );
+
+        let target = &paths[250];
+        reader.reader().reset();
+        let st1 = reader.stat(&target.0).unwrap();
+        assert_eq!(st1.size, target.1.len() as u64);
+        assert!(reader.reader().reads() >= 1);
+
+        // Second lookup must hit thread-local 2-way Arc L1 with zero backing reads
+        // even though each leaf node payload exceeds 8 KiB.
+        reader.reader().reset();
+        let st2 = reader.stat(&target.0).unwrap();
+        assert_eq!(st2, st1);
+        assert_eq!(reader.reader().reads(), 0);
+
+        // clear_index_cache bumps cache_tag and invalidates L1 and L2 cleanly.
+        reader.clear_index_cache();
+        reader.reader().reset();
+        let st3 = reader.stat(&target.0).unwrap();
+        assert_eq!(st3, st1);
+        assert!(reader.reader().reads() >= 1);
+
+        // Re-entrant `readdir_visit` calling `read_file` inside visitor on Buffered cache.
+        let mut visited = 0usize;
+        reader
+            .readdir_visit("/dir_02", |entry| {
+                let full = format!("/dir_02/{}", entry.name);
+                let got = reader.read_file(&full)?;
+                assert!(got.starts_with(b"content-"));
+                visited += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(visited, n_files / 4);
+
+        // Also test re-entrant `readdir_visit` + `read_file` on Contiguous reader.
+        let contig_reader = VzReader::open(arc).unwrap();
+        let mut contig_visited = 0usize;
+        contig_reader
+            .readdir_visit("/dir_02", |entry| {
+                let full = format!("/dir_02/{}", entry.name);
+                let got = contig_reader.read_file(&full)?;
+                assert!(got.starts_with(b"content-"));
+                contig_visited += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(contig_visited, n_files / 4);
+    }
 }

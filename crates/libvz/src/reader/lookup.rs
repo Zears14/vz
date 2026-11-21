@@ -1,11 +1,33 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use super::{
-    CachedNode, DirEntryRef, FastHasher, LookupTarget, NodeRef, ResolvedEntry, VzReader, VzStat,
-    parse_dir_node_body, read_cluster_at,
+    CachedNode, DirEntryRef, FastHasher, LookupTarget, NodeCache, NodeRef, ResolvedEntry,
+    VerifiedSlice, VzReader, VzStat, parse_dir_node_body, read_cluster_at,
 };
+
+const MMAP_L1_SLOTS: usize = 64;
+const BUF_L1_SLOTS: usize = 16;
+const BUF_L1_MAX_PAYLOAD: usize = 8192;
+
+type BufL1Slot = Option<(u64, u64, Rc<CachedNode>)>;
+
+std::thread_local! {
+    static MMAP_NODE_L1: RefCell<[(u64, u64, VerifiedSlice); MMAP_L1_SLOTS]> = const {
+        RefCell::new([(0, 0, VerifiedSlice { start: 0, len: 0, entry_count: 0 }); MMAP_L1_SLOTS])
+    };
+    static BUF_NODE_L1: RefCell<[BufL1Slot; BUF_L1_SLOTS]> = const {
+        RefCell::new([const { None }; BUF_L1_SLOTS])
+    };
+}
+
+#[inline]
+fn node_l1_slot(offset: u64, len: usize) -> usize {
+    ((offset >> 6).wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize) & (len - 1)
+}
 use crate::btree::{LeafNodeView, RouteTableView, validate_cluster};
 use crate::error::VzError;
 use crate::ext_meta::{
@@ -387,66 +409,172 @@ impl<R: RangeReader> VzReader<R> {
         Err(VzError::NotFound)
     }
 
-    fn read_cluster_node_cached(
+    fn with_cluster_node<T>(
         &self,
         offset: u64,
         expected_len: Option<u32>,
-    ) -> Result<Arc<CachedNode>, VzError> {
-        if let Ok(guard) = self.node_cache.read()
-            && let Some(hit) = guard.get(&offset)
-        {
-            return Ok(Arc::clone(hit));
-        }
+        f: impl FnOnce(&[u8], u32) -> Result<T, VzError>,
+    ) -> Result<T, VzError> {
+        let tag = self.cache_tag.load(Ordering::Acquire);
+        match &self.node_cache {
+            NodeCache::Contiguous { shards, mask } => {
+                let all = self.reader.contiguous_bytes().ok_or(VzError::BadFormat)?;
+                let l1_idx = node_l1_slot(offset, MMAP_L1_SLOTS);
+                let l1_hit = MMAP_NODE_L1
+                    .try_with(|cell| {
+                        let Ok(arr) = cell.try_borrow() else {
+                            return None;
+                        };
+                        let (e_tag, e_off, vs) = arr[l1_idx];
+                        if e_tag == tag && e_off == offset {
+                            Some(vs)
+                        } else {
+                            None
+                        }
+                    })
+                    .ok()
+                    .flatten();
+                if let Some(vs) = l1_hit {
+                    let slice = all
+                        .get(vs.start..vs.start + vs.len)
+                        .ok_or(VzError::BufferTooSmall)?;
+                    return f(slice, vs.entry_count);
+                }
 
-        let validated = if let Some(all) = self.reader.contiguous_bytes() {
-            let off_u = usize::try_from(offset).map_err(|_| VzError::ValueOverflow)?;
-            let slice = match expected_len {
-                Some(clen) => {
-                    let end = off_u
-                        .checked_add(clen as usize)
-                        .ok_or(VzError::ValueOverflow)?;
-                    all.get(off_u..end).ok_or(VzError::BufferTooSmall)?
+                let s_idx = NodeCache::shard_idx(offset, *mask);
+                let mut vs_opt = None;
+                if let Ok(guard) = shards[s_idx].0.read()
+                    && let Some(&vs) = guard.get(&offset)
+                {
+                    vs_opt = Some(vs);
                 }
-                None => {
-                    let hdr = ClusterHeader::from_bytes(
-                        all.get(off_u..).ok_or(VzError::BufferTooSmall)?,
-                    )?;
-                    let clen =
-                        usize::try_from(hdr.cluster_len).map_err(|_| VzError::ValueOverflow)?;
-                    let end = off_u.checked_add(clen).ok_or(VzError::ValueOverflow)?;
-                    all.get(off_u..end).ok_or(VzError::BufferTooSmall)?
-                }
-            };
-            let (_, body, _) = validate_cluster(slice)?;
-            let (_level, count, payload) = parse_dir_node_body(body)?;
-            Arc::new(CachedNode {
-                entry_count: count,
-                payload: Arc::from(payload),
-            })
-        } else {
-            let cluster_buf = match expected_len {
-                Some(clen) => {
-                    let mut buf = vec![0u8; clen as usize];
-                    self.reader.read_at(offset, &mut buf)?;
-                    buf
-                }
-                None => read_cluster_at(&self.reader, offset)?,
-            };
-            let (_, body, _) = validate_cluster(&cluster_buf)?;
-            let (_level, count, payload) = parse_dir_node_body(body)?;
-            Arc::new(CachedNode {
-                entry_count: count,
-                payload: Arc::from(payload),
-            })
-        };
 
-        if let Ok(mut guard) = self.node_cache.write() {
-            let entry = guard
-                .entry(offset)
-                .or_insert_with(|| Arc::clone(&validated));
-            return Ok(Arc::clone(entry));
+                let vs = match vs_opt {
+                    Some(hit) => hit,
+                    None => {
+                        let off_u = usize::try_from(offset).map_err(|_| VzError::ValueOverflow)?;
+                        let cluster_slice = match expected_len {
+                            Some(clen) => {
+                                let end = off_u
+                                    .checked_add(clen as usize)
+                                    .ok_or(VzError::ValueOverflow)?;
+                                all.get(off_u..end).ok_or(VzError::BufferTooSmall)?
+                            }
+                            None => {
+                                let hdr = ClusterHeader::from_bytes(
+                                    all.get(off_u..).ok_or(VzError::BufferTooSmall)?,
+                                )?;
+                                let clen = usize::try_from(hdr.cluster_len)
+                                    .map_err(|_| VzError::ValueOverflow)?;
+                                let end =
+                                    off_u.checked_add(clen).ok_or(VzError::ValueOverflow)?;
+                                all.get(off_u..end).ok_or(VzError::BufferTooSmall)?
+                            }
+                        };
+                        let (_, body, _) = validate_cluster(cluster_slice)?;
+                        let (_level, count, payload) = parse_dir_node_body(body)?;
+                        let start = (payload.as_ptr() as usize)
+                            .checked_sub(all.as_ptr() as usize)
+                            .ok_or(VzError::BadFormat)?;
+                        let cand = VerifiedSlice {
+                            start,
+                            len: payload.len(),
+                            entry_count: count,
+                        };
+                        if let Ok(mut guard) = shards[s_idx].0.write() {
+                            *guard.entry(offset).or_insert(cand)
+                        } else {
+                            cand
+                        }
+                    }
+                };
+
+                if self.cache_tag.load(Ordering::Acquire) == tag {
+                    let _ = MMAP_NODE_L1.try_with(|cell| {
+                        if let Ok(mut arr) = cell.try_borrow_mut() {
+                            arr[l1_idx] = (tag, offset, vs);
+                        }
+                    });
+                }
+                let slice = all
+                    .get(vs.start..vs.start + vs.len)
+                    .ok_or(VzError::BufferTooSmall)?;
+                f(slice, vs.entry_count)
+            }
+            NodeCache::Buffered { shards, mask } => {
+                let l1_idx = node_l1_slot(offset, BUF_L1_SLOTS);
+                let l1_hit = BUF_NODE_L1
+                    .try_with(|cell| {
+                        let Ok(arr) = cell.try_borrow() else {
+                            return None;
+                        };
+                        if let Some((e_tag, e_off, ref rc_node)) = arr[l1_idx]
+                            && e_tag == tag
+                            && e_off == offset
+                        {
+                            Some(Rc::clone(rc_node))
+                        } else {
+                            None
+                        }
+                    })
+                    .ok()
+                    .flatten();
+                if let Some(rc_node) = l1_hit {
+                    return f(&rc_node.payload, rc_node.entry_count);
+                }
+
+                let s_idx = NodeCache::shard_idx(offset, *mask);
+                let mut arc_opt = None;
+                if let Ok(guard) = shards[s_idx].0.read()
+                    && let Some(hit) = guard.get(&offset)
+                {
+                    arc_opt = Some(Arc::clone(hit));
+                }
+
+                let node = match arc_opt {
+                    Some(hit) => hit,
+                    None => {
+                        let cluster_buf = match expected_len {
+                            Some(clen) => {
+                                let mut buf = vec![0u8; clen as usize];
+                                self.reader.read_at(offset, &mut buf)?;
+                                buf
+                            }
+                            None => read_cluster_at(&self.reader, offset)?,
+                        };
+                        let (_, body, _) = validate_cluster(&cluster_buf)?;
+                        let (_level, count, payload) = parse_dir_node_body(body)?;
+                        let cand = Arc::new(CachedNode {
+                            entry_count: count,
+                            payload: Box::from(payload),
+                        });
+                        if let Ok(mut guard) = shards[s_idx].0.write() {
+                            Arc::clone(guard.entry(offset).or_insert_with(|| Arc::clone(&cand)))
+                        } else {
+                            cand
+                        }
+                    }
+                };
+
+                if node.payload.len() <= BUF_L1_MAX_PAYLOAD
+                    && self.cache_tag.load(Ordering::Acquire) == tag
+                {
+                    let _ = BUF_NODE_L1.try_with(|cell| {
+                        if let Ok(mut arr) = cell.try_borrow_mut() {
+                            arr[l1_idx] = Some((
+                                tag,
+                                offset,
+                                Rc::new(CachedNode {
+                                    entry_count: node.entry_count,
+                                    payload: node.payload.clone(),
+                                }),
+                            ));
+                        }
+                    });
+                }
+                f(&node.payload, node.entry_count)
+            }
         }
-        Ok(validated)
     }
 
     #[inline]
@@ -552,22 +680,23 @@ impl<R: RangeReader> VzReader<R> {
         loop {
             if cur_height == 0 {
                 if cur_is_cluster {
-                    let cached = self.read_cluster_node_cached(cur_off, cur_cluster_len)?;
                     // Cluster CRC32C was already validated when populating `node_cache`.
-                    let leaf = LeafNodeView::parse_trusted(&cached.payload)?;
-                    if let Some(de) = leaf.lookup_raw_exact(
-                        parent_hash,
-                        name_hash,
-                        Some(basename.as_bytes()),
-                        Some(parent_path.as_bytes()),
-                    )? {
-                        return Ok(Some(self.decode_lookup_target(
-                            de,
-                            leaf.ext_meta_pool(),
-                            run.run_generation,
-                        )?));
-                    }
-                    return Ok(None);
+                    return self.with_cluster_node(cur_off, cur_cluster_len, |payload, _cnt| {
+                        let leaf = LeafNodeView::parse_trusted(payload)?;
+                        if let Some(de) = leaf.lookup_raw_exact(
+                            parent_hash,
+                            name_hash,
+                            Some(basename.as_bytes()),
+                            Some(parent_path.as_bytes()),
+                        )? {
+                            return Ok(Some(self.decode_lookup_target(
+                                de,
+                                leaf.ext_meta_pool(),
+                                run.run_generation,
+                            )?));
+                        }
+                        Ok(None)
+                    });
                 } else if let Some((_, _, ref pipe_bytes)) = self.pipe_root {
                     let leaf = LeafNodeView::parse(pipe_bytes)?;
                     if let Some(de) = leaf.lookup_raw_exact(
@@ -604,9 +733,10 @@ impl<R: RangeReader> VzReader<R> {
 
             // Internal node: `RouteTableView`.
             let route = if cur_is_cluster {
-                let cached = self.read_cluster_node_cached(cur_off, cur_cluster_len)?;
-                let table = RouteTableView::new(&cached.payload, cached.entry_count as usize)?;
-                table.lookup(parent_hash, name_hash)?
+                self.with_cluster_node(cur_off, cur_cluster_len, |payload, cnt| {
+                    let table = RouteTableView::new(payload, cnt as usize)?;
+                    table.lookup(parent_hash, name_hash)
+                })?
             } else if let Some((_, cnt, ref pipe_bytes)) = self.pipe_root {
                 let table = RouteTableView::new(pipe_bytes, cnt as usize)?;
                 table.lookup(parent_hash, name_hash)?
@@ -643,11 +773,27 @@ impl<R: RangeReader> VzReader<R> {
 
         loop {
             if cur_height == 0 {
-                let leaf_owned: Arc<CachedNode>;
-                let leaf = if cur_is_cluster {
-                    leaf_owned = self.read_cluster_node_cached(cur_off, cur_cluster_len)?;
-                    LeafNodeView::parse_trusted(&leaf_owned.payload)?
-                } else if let Some((_, _, ref pipe_bytes)) = self.pipe_root {
+                if cur_is_cluster {
+                    return self.with_cluster_node(cur_off, cur_cluster_len, |payload, _cnt| {
+                        let leaf = LeafNodeView::parse_trusted(payload)?;
+                        if let Some(de) = leaf.lookup_raw_exact(
+                            parent_hash,
+                            name_hash,
+                            Some(basename.as_bytes()),
+                            Some(parent_path.as_bytes()),
+                        )? {
+                            return Ok(Some(self.decode_resolved_entry(
+                                &de,
+                                leaf.name_pool(),
+                                leaf.ext_meta_pool(),
+                                parent_path,
+                                run.run_generation,
+                            )?));
+                        }
+                        Ok(None)
+                    });
+                }
+                let leaf = if let Some((_, _, ref pipe_bytes)) = self.pipe_root {
                     LeafNodeView::parse(pipe_bytes.as_slice())?
                 } else {
                     let off = usize::try_from(cur_off).map_err(|_| VzError::ValueOverflow)?;
@@ -672,9 +818,10 @@ impl<R: RangeReader> VzReader<R> {
 
             // Internal node: `RouteTableView`.
             let route = if cur_is_cluster {
-                let cached = self.read_cluster_node_cached(cur_off, cur_cluster_len)?;
-                let table = RouteTableView::new(&cached.payload, cached.entry_count as usize)?;
-                table.lookup(parent_hash, name_hash)?
+                self.with_cluster_node(cur_off, cur_cluster_len, |payload, cnt| {
+                    let table = RouteTableView::new(payload, cnt as usize)?;
+                    table.lookup(parent_hash, name_hash)
+                })?
             } else if let Some((_, cnt, ref pipe_bytes)) = self.pipe_root {
                 let table = RouteTableView::new(pipe_bytes, cnt as usize)?;
                 table.lookup(parent_hash, name_hash)?
@@ -764,9 +911,10 @@ impl<R: RangeReader> VzReader<R> {
                 return visitor(&leaf);
             }
             if node.is_cluster {
-                let cached = self.read_cluster_node_cached(node.off, node.cluster_len)?;
-                let leaf = LeafNodeView::parse_trusted(&cached.payload)?;
-                return visitor(&leaf);
+                return self.with_cluster_node(node.off, node.cluster_len, |payload, _cnt| {
+                    let leaf = LeafNodeView::parse_trusted(payload)?;
+                    visitor(&leaf)
+                });
             }
             if let Some((_, _, ref pipe_bytes)) = self.pipe_root {
                 let leaf = LeafNodeView::parse(pipe_bytes)?;
@@ -776,47 +924,38 @@ impl<R: RangeReader> VzReader<R> {
             return Err(VzError::BadFormat);
         }
 
-        let routes: Vec<RouteEntry> = if !node.is_cluster && self.pipe_root.is_none() {
+        let mut routes: Vec<RouteEntry> = Vec::new();
+        let collect_routes = |table: RouteTableView<'_>, out: &mut Vec<RouteEntry>| -> Result<(), VzError> {
+            let Some((start, _)) = table.lower_bound(parent_hash, 0)? else {
+                return Ok(());
+            };
+            for i in start..table.len() {
+                let r = table.get(i)?;
+                if r.min_parent_hash > parent_hash {
+                    break;
+                }
+                out.push(r);
+            }
+            Ok(())
+        };
+        if !node.is_cluster && self.pipe_root.is_none() {
             let off = usize::try_from(node.off).map_err(|_| VzError::ValueOverflow)?;
             let table = RouteTableView::new(&self.boot_block[off..], node.entry_count)?;
-            let start = match table.lower_bound(parent_hash, 0)? {
-                Some((i, _)) => i,
-                None => return Ok(()),
-            };
-            let mut v = Vec::new();
-            for i in start..table.len() {
-                let r = table.get(i)?;
-                if r.min_parent_hash > parent_hash {
-                    break;
-                }
-                v.push(r);
-            }
-            v
+            collect_routes(table, &mut routes)?;
+        } else if node.is_cluster {
+            self.with_cluster_node(node.off, node.cluster_len, |payload, cnt| {
+                let table = RouteTableView::new(payload, cnt as usize)?;
+                collect_routes(table, &mut routes)
+            })?;
+        } else if let Some((_, cnt, ref pipe_bytes)) = self.pipe_root {
+            let table = RouteTableView::new(pipe_bytes, cnt as usize)?;
+            collect_routes(table, &mut routes)?;
         } else {
-            let cached_holder: Arc<CachedNode>;
-            let (node_slice, cnt) = if node.is_cluster {
-                cached_holder = self.read_cluster_node_cached(node.off, node.cluster_len)?;
-                (&cached_holder.payload[..], cached_holder.entry_count as usize)
-            } else if let Some((_, cnt, ref pipe_bytes)) = self.pipe_root {
-                (pipe_bytes.as_slice(), cnt as usize)
-            } else {
-                return Err(VzError::BadFormat);
-            };
-            let table = RouteTableView::new(node_slice, cnt)?;
-            let start = match table.lower_bound(parent_hash, 0)? {
-                Some((i, _)) => i,
-                None => return Ok(()),
-            };
-            let mut v = Vec::new();
-            for i in start..table.len() {
-                let r = table.get(i)?;
-                if r.min_parent_hash > parent_hash {
-                    break;
-                }
-                v.push(r);
-            }
-            v
-        };
+            return Err(VzError::BadFormat);
+        }
+        if routes.is_empty() {
+            return Ok(());
+        }
 
         for r in routes {
             self.visit_leaves_for_parent_with_scratch(
@@ -877,9 +1016,10 @@ impl<R: RangeReader> VzReader<R> {
                 return visitor(&leaf);
             }
             if node.is_cluster {
-                let cached = self.read_cluster_node_cached(node.off, node.cluster_len)?;
-                let leaf = LeafNodeView::parse_trusted(&cached.payload)?;
-                return visitor(&leaf);
+                return self.with_cluster_node(node.off, node.cluster_len, |payload, _cnt| {
+                    let leaf = LeafNodeView::parse_trusted(payload)?;
+                    visitor(&leaf)
+                });
             }
             if let Some((_, _, ref pipe_bytes)) = self.pipe_root {
                 let leaf = LeafNodeView::parse(pipe_bytes)?;
@@ -895,11 +1035,12 @@ impl<R: RangeReader> VzReader<R> {
                 .map(|i| table.get(i))
                 .collect::<Result<Vec<_>, _>>()?
         } else if node.is_cluster {
-            let cached = self.read_cluster_node_cached(node.off, node.cluster_len)?;
-            let table = RouteTableView::new(&cached.payload, cached.entry_count as usize)?;
-            (0..table.len())
-                .map(|i| table.get(i))
-                .collect::<Result<Vec<_>, _>>()?
+            self.with_cluster_node(node.off, node.cluster_len, |payload, cnt| {
+                let table = RouteTableView::new(payload, cnt as usize)?;
+                (0..table.len())
+                    .map(|i| table.get(i))
+                    .collect::<Result<Vec<_>, _>>()
+            })?
         } else if let Some((_, cnt, ref pipe_bytes)) = self.pipe_root {
             let table = RouteTableView::new(pipe_bytes, cnt as usize)?;
             (0..table.len())

@@ -9,7 +9,7 @@ pub use verify_repair::{
 pub(super) use verify_repair::{parse_dir_node_body, read_cluster_at, read_tail_cluster};
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::btree::validate_cluster;
@@ -131,9 +131,85 @@ pub struct DirEntryRef<'a> {
     pub ext_meta_pool: &'a [u8],
 }
 
+#[repr(align(64))]
+pub(super) struct CachePadded<T>(pub(super) T);
+
+#[derive(Clone, Copy)]
+pub(super) struct VerifiedSlice {
+    pub(super) start: usize,
+    pub(super) len: usize,
+    pub(super) entry_count: u32,
+}
+
 pub(super) struct CachedNode {
     pub(super) entry_count: u32,
-    pub(super) payload: Arc<[u8]>,
+    pub(super) payload: Box<[u8]>,
+}
+
+static NEXT_CACHE_TAG: AtomicU64 = AtomicU64::new(1);
+
+#[inline]
+pub(super) fn next_cache_tag() -> u64 {
+    NEXT_CACHE_TAG.fetch_add(1, Ordering::Relaxed)
+}
+
+type NodeShard<V> = CachePadded<RwLock<HashMap<u64, V>>>;
+
+pub(super) enum NodeCache {
+    Contiguous {
+        shards: Box<[NodeShard<VerifiedSlice>]>,
+        mask: usize,
+    },
+    Buffered {
+        shards: Box<[NodeShard<Arc<CachedNode>>]>,
+        mask: usize,
+    },
+}
+
+impl NodeCache {
+    fn new(is_contiguous: bool) -> Self {
+        let shard_count = crate::parallel::cached_parallelism()
+            .next_power_of_two()
+            .clamp(4, 64);
+        let mask = shard_count - 1;
+        if is_contiguous {
+            let shards = (0..shard_count)
+                .map(|_| CachePadded(RwLock::new(HashMap::new())))
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            Self::Contiguous { shards, mask }
+        } else {
+            let shards = (0..shard_count)
+                .map(|_| CachePadded(RwLock::new(HashMap::new())))
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            Self::Buffered { shards, mask }
+        }
+    }
+
+    #[inline]
+    pub(super) fn shard_idx(offset: u64, mask: usize) -> usize {
+        ((offset >> 6).wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize) & mask
+    }
+
+    fn clear(&self) {
+        match self {
+            Self::Contiguous { shards, .. } => {
+                for shard in shards.iter() {
+                    if let Ok(mut g) = shard.0.write() {
+                        g.clear();
+                    }
+                }
+            }
+            Self::Buffered { shards, .. } => {
+                for shard in shards.iter() {
+                    if let Ok(mut g) = shard.0.write() {
+                        g.clear();
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub(super) struct LookupTarget {
@@ -202,8 +278,10 @@ pub struct VzReader<R: RangeReader> {
     pub(super) extra_registry_tlvs: Vec<RawTlv>,
     /// Embedded root bytes when opened from an unfinalized pipe via `TAG_ROOT_FALLBACK`.
     pub(super) pipe_root: Option<(u8, u32, Vec<u8>)>,
-    /// Verified B+Tree internal/leaf node cache populated lazily on first cluster validation.
-    pub(super) node_cache: RwLock<HashMap<u64, Arc<CachedNode>>>,
+    /// Monotonic epoch tag invalidating per-thread L1 node caches on `clear_index_cache`.
+    pub(super) cache_tag: AtomicU64,
+    /// Sharded verified B+Tree internal/leaf node cache populated lazily on first cluster validation.
+    pub(super) node_cache: NodeCache,
 }
 
 
@@ -370,6 +448,7 @@ impl<R: RangeReader> VzReader<R> {
         }
 
         let dict_cache = ZstdDictCache::new(&dicts, 3);
+        let is_contiguous = reader.contiguous_bytes().is_some();
         Ok(Self {
             reader,
             boot_block,
@@ -385,15 +464,15 @@ impl<R: RangeReader> VzReader<R> {
             lsm_runs,
             extra_registry_tlvs,
             pipe_root,
-            node_cache: RwLock::new(HashMap::new()),
+            cache_tag: AtomicU64::new(next_cache_tag()),
+            node_cache: NodeCache::new(is_contiguous),
         })
     }
 
     /// Clears the in-memory verified B+Tree node cache.
     pub fn clear_index_cache(&self) {
-        if let Ok(mut g) = self.node_cache.write() {
-            g.clear();
-        }
+        self.cache_tag.store(next_cache_tag(), Ordering::Release);
+        self.node_cache.clear();
     }
 
     pub fn active_slot(&self) -> &HeaderSlot {

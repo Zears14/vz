@@ -4,7 +4,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use super::{RepairReport, SUPPORTED_INCOMPAT, VerifyReport, VzReader, VzReaderOptions};
 use crate::btree::{LeafNodeView, validate_cluster};
 use crate::codec::EncryptionKey;
-use crate::crc::crc32c;
+use crate::crc::{crc32c, crc32c_combine, crc32c_update};
 use crate::ecc::boot_ecc_verify_and_repair;
 use crate::error::VzError;
 use crate::ext_meta::DataManifestHeader;
@@ -35,6 +35,169 @@ pub(crate) fn read_cluster_at<R: RangeReader>(reader: &R, offset: u64) -> Result
     full[..ClusterHeader::SIZE].copy_from_slice(&hdr_buf);
     reader.read_at(offset + ClusterHeader::SIZE as u64, &mut full[ClusterHeader::SIZE..])?;
     Ok(full)
+}
+
+fn read_cluster_into<R: RangeReader>(
+    reader: &R,
+    offset: u64,
+    buf: &mut Vec<u8>,
+) -> Result<(), VzError> {
+    let mut hdr_buf = [0u8; ClusterHeader::SIZE];
+    reader.read_at(offset, &mut hdr_buf)?;
+    let hdr = ClusterHeader::from_bytes(&hdr_buf)?;
+    if hdr.sync_magic != MAGIC_CLUSTER {
+        return Err(VzError::BadMagic);
+    }
+    let clen = usize::try_from(hdr.cluster_len).map_err(|_| VzError::ValueOverflow)?;
+    if clen < ClusterHeader::SIZE + ClusterFooter::SIZE {
+        return Err(VzError::BadFormat);
+    }
+    buf.resize(clen, 0);
+    buf[..ClusterHeader::SIZE].copy_from_slice(&hdr_buf);
+    reader.read_at(
+        offset + ClusterHeader::SIZE as u64,
+        &mut buf[ClusterHeader::SIZE..],
+    )?;
+    Ok(())
+}
+
+enum ClusterCheck {
+    Corrupt(VzError),
+    Ok(ClusterHeader),
+}
+
+fn verify_cluster_single_pass(
+    cluster: &[u8],
+    pos: u64,
+    errors: &mut Vec<String>,
+    parity_stripes: &mut Vec<u64>,
+) -> Result<ClusterCheck, VzError> {
+    let min_len = ClusterHeader::SIZE + ClusterFooter::SIZE;
+    if cluster.len() < min_len {
+        return Ok(ClusterCheck::Corrupt(VzError::BufferTooSmall));
+    }
+    let chdr = match ClusterHeader::from_bytes(cluster) {
+        Ok(h) => h,
+        Err(e) => return Ok(ClusterCheck::Corrupt(e)),
+    };
+    if chdr.sync_magic != MAGIC_CLUSTER {
+        return Ok(ClusterCheck::Corrupt(VzError::BadMagic));
+    }
+    if chdr.cluster_len < min_len as u64 || (chdr.cluster_len & 7) != 0 {
+        return Ok(ClusterCheck::Corrupt(VzError::BadFormat));
+    }
+    let clen = match usize::try_from(chdr.cluster_len) {
+        Ok(c) => c,
+        Err(_) => return Ok(ClusterCheck::Corrupt(VzError::ValueOverflow)),
+    };
+    if cluster.len() < clen {
+        return Ok(ClusterCheck::Corrupt(VzError::BufferTooSmall));
+    }
+    let ftr = match ClusterFooter::from_bytes(&cluster[clen - ClusterFooter::SIZE..clen]) {
+        Ok(f) => f,
+        Err(e) => return Ok(ClusterCheck::Corrupt(e)),
+    };
+    if ftr.footer_magic != MAGIC_FOOTER {
+        return Ok(ClusterCheck::Corrupt(VzError::BadMagic));
+    }
+    if ftr.cluster_len != chdr.cluster_len {
+        return Ok(ClusterCheck::Corrupt(VzError::BadFormat));
+    }
+
+    let body = &cluster[ClusterHeader::SIZE..clen - ClusterFooter::SIZE];
+    let mut crc_acc = crc32c(&cluster[..ClusterHeader::SIZE]);
+    let mut hashed_until = ClusterHeader::SIZE;
+    let mut local_errors: Vec<String> = Vec::new();
+    let mut local_stripes: Vec<u64> = Vec::new();
+    let base_ptr = cluster.as_ptr() as usize;
+
+    for elem_res in TlvIter::new(body) {
+        let elem = match elem_res {
+            Ok(e) => e,
+            Err(e) => {
+                if hashed_until < clen - 8 {
+                    crc_acc = !crc32c_update(!crc_acc, &cluster[hashed_until..clen - 8]);
+                }
+                if crc_acc != ftr.cluster_crc32c {
+                    return Ok(ClusterCheck::Corrupt(VzError::CrcMismatch));
+                }
+                local_errors.push(format!("cluster TLV error at {pos:#x}: {e}"));
+                errors.extend(local_errors);
+                parity_stripes.extend(local_stripes);
+                return Ok(ClusterCheck::Ok(chdr));
+            }
+        };
+        match elem.tag {
+            TAG_DATA_MANIFEST => {
+                let dm = match DataManifestHeader::from_bytes(elem.value) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        if hashed_until < clen - 8 {
+                            crc_acc = !crc32c_update(!crc_acc, &cluster[hashed_until..clen - 8]);
+                        }
+                        if crc_acc != ftr.cluster_crc32c {
+                            return Ok(ClusterCheck::Corrupt(VzError::CrcMismatch));
+                        }
+                        return Err(e);
+                    }
+                };
+                let rel = dm.payload_rel_off as usize;
+                let slen = match usize::try_from(dm.stored_size) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        if hashed_until < clen - 8 {
+                            crc_acc = !crc32c_update(!crc_acc, &cluster[hashed_until..clen - 8]);
+                        }
+                        if crc_acc != ftr.cluster_crc32c {
+                            return Ok(ClusterCheck::Corrupt(VzError::CrcMismatch));
+                        }
+                        return Err(VzError::ValueOverflow);
+                    }
+                };
+                if rel.checked_add(slen).is_none_or(|e| e > elem.value.len()) {
+                    local_errors.push(format!("manifest bounds overflow at {pos:#x}"));
+                } else {
+                    let val_start = elem.value.as_ptr() as usize - base_ptr;
+                    let p_start = val_start + rel;
+                    let p_end = p_start + slen;
+                    if p_start > hashed_until {
+                        crc_acc = !crc32c_update(!crc_acc, &cluster[hashed_until..p_start]);
+                    }
+                    let payload_crc = crc32c(&cluster[p_start..p_end]);
+                    crc_acc = crc32c_combine(crc_acc, payload_crc, slen);
+                    hashed_until = p_end;
+                    if payload_crc != dm.payload_crc32c {
+                        local_errors.push(format!("payload CRC mismatch in cluster {pos:#x}"));
+                    }
+                }
+            }
+            TAG_DIR_NODE => {
+                if let Err(e) = parse_dir_node_body(body) {
+                    local_errors.push(format!("DirNode CRC error at {pos:#x}: {e}"));
+                } else if elem.value.first().copied() == Some(0)
+                    && let Err(e) = LeafNodeView::parse(&elem.value[8..])
+                {
+                    local_errors.push(format!("LeafNode CRC error at {pos:#x}: {e}"));
+                }
+            }
+            TAG_PARITY_CLUSTER => {
+                if let Ok(Some((manifest, _, _))) = parse_parity_cluster_body(body) {
+                    local_stripes.push(manifest.first_cluster_seq);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if hashed_until < clen - 8 {
+        crc_acc = !crc32c_update(!crc_acc, &cluster[hashed_until..clen - 8]);
+    }
+    if crc_acc != ftr.cluster_crc32c {
+        return Ok(ClusterCheck::Corrupt(VzError::CrcMismatch));
+    }
+    errors.extend(local_errors);
+    parity_stripes.extend(local_stripes);
+    Ok(ClusterCheck::Ok(chdr))
 }
 
 pub(crate) fn read_tail_cluster<R: RangeReader>(reader: &R, total_len: u64) -> Result<Vec<u8>, VzError> {
@@ -251,32 +414,177 @@ pub fn verify_archive<R: RangeReader>(
 
     let boot_end = vz.active_slot().boot_block_size as u64;
     let total_len = reader.total_len()?;
+    let mut parity_stripes_seen: HashSet<u64> = HashSet::new();
+
+    if let Some(all) = reader.contiguous_bytes() {
+        let mut pos_u = usize::try_from(boot_end).map_err(|_| VzError::ValueOverflow)?;
+        let total_u = usize::try_from(total_len).map_err(|_| VzError::ValueOverflow)?;
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        let mut exp_prev = 0u64;
+        let mut exp_seq = 0u64;
+        let mut clean_scan = true;
+        while pos_u < total_u {
+            let Ok(hdr) = ClusterHeader::from_bytes(&all[pos_u..]) else {
+                clean_scan = false;
+                break;
+            };
+            if hdr.sync_magic != MAGIC_CLUSTER
+                || hdr.prev_cluster_len != exp_prev
+                || hdr.cluster_seq != exp_seq
+            {
+                clean_scan = false;
+                break;
+            }
+            let Ok(clen) = usize::try_from(hdr.cluster_len) else {
+                clean_scan = false;
+                break;
+            };
+            if clen < ClusterHeader::SIZE + ClusterFooter::SIZE
+                || (clen & 7) != 0
+                || pos_u + clen > total_u
+            {
+                clean_scan = false;
+                break;
+            }
+            spans.push((pos_u, pos_u + clen));
+            exp_prev = hdr.cluster_len;
+            exp_seq += 1;
+            pos_u += clen;
+        }
+
+        if clean_scan && pos_u == total_u {
+            let workers = if spans.len() >= 8 {
+                crate::parallel::adaptive_workers(
+                    spans.len(),
+                    total_u.saturating_sub(boot_end as usize),
+                    4 * 1024 * 1024,
+                )
+            } else {
+                1
+            };
+            if workers <= 1 {
+                let mut local_errs = Vec::new();
+                let mut local_stripes = Vec::new();
+                let mut hit_corrupt = false;
+                for &(start, end) in &spans {
+                    match verify_cluster_single_pass(
+                        &all[start..end],
+                        start as u64,
+                        &mut local_errs,
+                        &mut local_stripes,
+                    )? {
+                        ClusterCheck::Ok(_) => {}
+                        ClusterCheck::Corrupt(_) => {
+                            hit_corrupt = true;
+                            break;
+                        }
+                    }
+                }
+                if !hit_corrupt {
+                    report.clusters_checked = spans.len();
+                    for s in local_stripes {
+                        if parity_stripes_seen.insert(s) {
+                            report.parity_stripes_checked += 1;
+                        }
+                    }
+                    report.errors.extend(local_errs);
+                    return Ok(report);
+                }
+            } else {
+                #[derive(Default)]
+                struct VerifyChunkOut {
+                    checked: usize,
+                    errs: Vec<String>,
+                    stripes: Vec<u64>,
+                    corrupt: bool,
+                }
+                let group_sz = spans.len().div_ceil(workers);
+                let grp_results: Vec<Result<VerifyChunkOut, VzError>> =
+                    std::thread::scope(|s| {
+                        let handles: Vec<_> = spans
+                            .chunks(group_sz)
+                            .map(|grp| {
+                                s.spawn(move || -> Result<VerifyChunkOut, VzError> {
+                                    let mut out = VerifyChunkOut::default();
+                                    for &(start, end) in grp {
+                                        match verify_cluster_single_pass(
+                                            &all[start..end],
+                                            start as u64,
+                                            &mut out.errs,
+                                            &mut out.stripes,
+                                        )? {
+                                            ClusterCheck::Ok(_) => {}
+                                            ClusterCheck::Corrupt(_) => {
+                                                return Ok(VerifyChunkOut {
+                                                    corrupt: true,
+                                                    ..Default::default()
+                                                });
+                                            }
+                                        }
+                                    }
+                                    out.checked = grp.len();
+                                    Ok(out)
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .map(|h| h.join().map_err(|_| VzError::IoError).and_then(|r| r))
+                            .collect()
+                    });
+                let mut all_ok = true;
+                let mut merged_checked = 0usize;
+                let mut merged_errs = Vec::new();
+                let mut merged_stripes = Vec::new();
+                for res in grp_results {
+                    let chunk_out = res?;
+                    if chunk_out.corrupt {
+                        all_ok = false;
+                        break;
+                    }
+                    merged_checked += chunk_out.checked;
+                    merged_errs.extend(chunk_out.errs);
+                    merged_stripes.extend(chunk_out.stripes);
+                }
+                if all_ok {
+                    report.clusters_checked = merged_checked;
+                    for s in merged_stripes {
+                        if parity_stripes_seen.insert(s) {
+                            report.parity_stripes_checked += 1;
+                        }
+                    }
+                    report.errors.extend(merged_errs);
+                    return Ok(report);
+                }
+            }
+        }
+    }
+
     let mut pos = boot_end;
     let mut expected_prev = 0u64;
     let mut expected_seq = 0u64;
     let mut just_resynced = false;
-    let mut parity_stripes_seen: HashSet<u64> = HashSet::new();
+    let mut cbuf = Vec::new();
+    let mut local_stripes = Vec::new();
 
     while pos < total_len {
-        let cbuf = match read_cluster_at(reader, pos) {
-            Ok(b) => b,
-            Err(e) => {
-                report
-                    .errors
-                    .push(format!("cluster at offset {pos:#x} unreadable: {e}"));
-                match resync_next_cluster(reader, pos + 8, total_len) {
-                    Some(next_pos) => {
-                        pos = next_pos;
-                        just_resynced = true;
-                        continue;
-                    }
-                    None => break,
+        if let Err(e) = read_cluster_into(reader, pos, &mut cbuf) {
+            report
+                .errors
+                .push(format!("cluster at offset {pos:#x} unreadable: {e}"));
+            match resync_next_cluster(reader, pos + 8, total_len) {
+                Some(next_pos) => {
+                    pos = next_pos;
+                    just_resynced = true;
+                    continue;
                 }
+                None => break,
             }
-        };
-        let (chdr, body, _) = match validate_cluster(&cbuf) {
-            Ok(v) => v,
-            Err(e) => {
+        }
+        local_stripes.clear();
+        let chdr = match verify_cluster_single_pass(&cbuf, pos, &mut report.errors, &mut local_stripes)? {
+            ClusterCheck::Ok(h) => h,
+            ClusterCheck::Corrupt(e) => {
                 report
                     .errors
                     .push(format!("cluster at offset {pos:#x} corrupt: {e}"));
@@ -290,6 +598,11 @@ pub fn verify_archive<R: RangeReader>(
                 }
             }
         };
+        for s in &local_stripes {
+            if parity_stripes_seen.insert(*s) {
+                report.parity_stripes_checked += 1;
+            }
+        }
         if !just_resynced
             && (chdr.prev_cluster_len != expected_prev || chdr.cluster_seq != expected_seq)
         {
@@ -299,57 +612,6 @@ pub fn verify_archive<R: RangeReader>(
             ));
         }
         just_resynced = false;
-
-        for elem in TlvIter::new(body) {
-            let elem = match elem {
-                Ok(e) => e,
-                Err(e) => {
-                    report
-                        .errors
-                        .push(format!("cluster TLV error at {pos:#x}: {e}"));
-                    break;
-                }
-            };
-            match elem.tag {
-                TAG_DATA_MANIFEST => {
-                    let dm = DataManifestHeader::from_bytes(elem.value)?;
-                    let rel = dm.payload_rel_off as usize;
-                    let slen = usize::try_from(dm.stored_size)
-                        .map_err(|_| VzError::ValueOverflow)?;
-                    if rel + slen > elem.value.len() {
-                        report
-                            .errors
-                            .push(format!("manifest bounds overflow at {pos:#x}"));
-                    } else if crc32c(&elem.value[rel..rel + slen]) != dm.payload_crc32c {
-                        report
-                            .errors
-                            .push(format!("payload CRC mismatch in cluster {pos:#x}"));
-                    }
-                }
-                TAG_DIR_NODE => {
-                    if let Err(e) = parse_dir_node_body(body) {
-                        report
-                            .errors
-                            .push(format!("DirNode CRC error at {pos:#x}: {e}"));
-                    } else if elem.value.first().copied() == Some(0)
-                        && let Err(e) = LeafNodeView::parse(&elem.value[8..])
-                    {
-                        report
-                            .errors
-                            .push(format!("LeafNode CRC error at {pos:#x}: {e}"));
-                    }
-                }
-                TAG_PARITY_CLUSTER => {
-                    if let Ok(Some((manifest, _, _))) = parse_parity_cluster_body(body)
-                        && parity_stripes_seen.insert(manifest.first_cluster_seq)
-                    {
-                        report.parity_stripes_checked += 1;
-                    }
-                }
-                _ => {}
-            }
-        }
-
         report.clusters_checked += 1;
         expected_prev = chdr.cluster_len;
         expected_seq += 1;

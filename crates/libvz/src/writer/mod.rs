@@ -835,26 +835,39 @@ impl<W: Write + Seek> VzWriter<W> {
         &mut self,
         items: &[(&'a str, &'a [u8], &'a EntryOptions)],
     ) -> Result<(), VzError> {
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-        let needs_parallel = items.len() >= 4
-            && threads > 1
-            && items.iter().any(|(_, data, opts)| {
-                let is_special = matches!(
-                    opts.kind & KIND_MASK,
-                    KIND_DIR
-                        | crate::wire::KIND_FIFO
-                        | crate::wire::KIND_CHR
-                        | crate::wire::KIND_BLK
-                        | crate::wire::KIND_SOCK
-                );
-                let (_, _, eff) = self.effective_codec_for(opts);
-                !is_special
-                    && opts.sparse.is_none()
-                    && eff != CODEC_NONE
-                    && (self.crypto.is_some() || data.len() > 27)
-                    && data.len() <= self.config.multi_cluster_threshold
-            });
-        if !needs_parallel {
+        let mut comp_items = 0usize;
+        let mut comp_bytes = 0usize;
+        let mut any_slow_codec = false;
+        for &(_, data, opts) in items {
+            let is_special = matches!(
+                opts.kind & KIND_MASK,
+                KIND_DIR
+                    | crate::wire::KIND_FIFO
+                    | crate::wire::KIND_CHR
+                    | crate::wire::KIND_BLK
+                    | crate::wire::KIND_SOCK
+            );
+            let (_, _, eff) = self.effective_codec_for(opts);
+            if !is_special
+                && opts.sparse.is_none()
+                && eff != CODEC_NONE
+                && (self.crypto.is_some() || data.len() > 27)
+                && data.len() <= self.config.multi_cluster_threshold
+            {
+                comp_items += 1;
+                comp_bytes = comp_bytes.saturating_add(data.len());
+                if eff != crate::wire::CODEC_LZ4 {
+                    any_slow_codec = true;
+                }
+            }
+        }
+        let min_bytes = if any_slow_codec {
+            16 * 1024
+        } else {
+            256 * 1024
+        };
+        let worker_count = crate::parallel::adaptive_workers(comp_items, comp_bytes, min_bytes);
+        if worker_count <= 1 {
             for &(path, data, opts) in items {
                 self.add_entry_bytes(path, data, opts.clone())?;
             }
@@ -869,7 +882,6 @@ impl<W: Write + Seek> VzWriter<W> {
         let zstd_level = self.config.zstd_level;
 
         type BatchGroupOut = Vec<Option<Result<Vec<u8>, VzError>>>;
-        let worker_count = threads.min(items.len());
         let group_size = items.len().div_ceil(worker_count);
         let group_results: Vec<BatchGroupOut> = std::thread::scope(|s| {
             let handles: Vec<_> = items
@@ -1038,14 +1050,19 @@ impl<W: Write + Seek> VzWriter<W> {
             let chunk_cap = self.config.target_cluster_size.max(4096);
             let chunks: Vec<&[u8]> = data.chunks(chunk_cap).collect();
             let target_gen = self.target_generation;
-            let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+            let should_parallel = effective_codec != CODEC_NONE || self.crypto.is_some();
+            let min_bytes = if effective_codec == crate::wire::CODEC_LZ4 && self.crypto.is_none() {
+                2 * 1024 * 1024
+            } else {
+                512 * 1024
+            };
+            let worker_count = if should_parallel {
+                crate::parallel::adaptive_workers(chunks.len(), data.len(), min_bytes)
+            } else {
+                1
+            };
 
-            let encoded_chunks: Option<Vec<Vec<u8>>> = if chunks.len() >= 2
-                && threads > 1
-                && ((effective_codec != CODEC_NONE && effective_codec != crate::wire::CODEC_LZ4)
-                    || self.crypto.is_some()
-                    || data.len() >= 128 * 1024 * 1024)
-            {
+            let encoded_chunks: Option<Vec<Vec<u8>>> = if worker_count >= 2 {
                 let seqs: Vec<u64> = (0..chunks.len())
                     .map(|i| self.emitter.next_data_cluster_seq(i))
                     .collect();
@@ -1054,7 +1071,6 @@ impl<W: Write + Seek> VzWriter<W> {
                 let zstd_level = self.config.zstd_level;
                 let crypto = self.crypto.as_ref().map(|(_, c)| c);
                 let ext_codec_ref = ext_codec.as_ref();
-                let worker_count = threads.min(chunks.len());
                 let group_sz = chunks.len().div_ceil(worker_count);
 
                 let group_results: Vec<Result<Vec<Vec<u8>>, VzError>> = std::thread::scope(|s| {
@@ -1091,16 +1107,14 @@ impl<W: Write + Seek> VzWriter<W> {
                                             &comp_scratch,
                                         )?);
                                     } else {
-                                        compress_payload_into_with_cache(
+                                        grp_out.push(compress_payload_with_cache(
                                             chunk,
-                                            &mut comp_scratch,
                                             effective_codec,
                                             ext_codec_ref,
                                             dicts,
                                             Some(dict_cache),
                                             zstd_level,
-                                        )?;
-                                        grp_out.push(comp_scratch.clone());
+                                        )?);
                                     }
                                 }
                                 Ok(grp_out)

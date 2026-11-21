@@ -9,8 +9,47 @@ use crate::ext_meta::{ChunkExtent, DictEntry, ExtCodecMeta, decode_chunk_table};
 use crate::io::RangeReader;
 use crate::wire::{ClusterFooter, ClusterHeader, DirPayload, MAGIC_CLUSTER, TAG_CHUNK_TABLE};
 
+const READ_TLS_CAP: usize = 1_048_576;
+
 std::thread_local! {
     static DEC_SCRATCH_TLS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static READ_SCRATCH_TLS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn read_with_tls_scratch<T>(
+    len: usize,
+    fill: impl FnOnce(&mut [u8]) -> Result<(), VzError>,
+    consume: impl FnOnce(&[u8]) -> Result<T, VzError>,
+) -> Result<T, VzError> {
+    if len > READ_TLS_CAP {
+        let mut buf = vec![0u8; len];
+        fill(&mut buf)?;
+        return consume(&buf);
+    }
+    let mut ops = Some((fill, consume));
+    if let Ok(res) = READ_SCRATCH_TLS.try_with(|cell| -> Result<T, VzError> {
+        let Some((f, c)) = ops.take() else {
+            return Err(VzError::IoError);
+        };
+        let Ok(mut buf) = cell.try_borrow_mut() else {
+            let mut fallback = vec![0u8; len];
+            f(&mut fallback)?;
+            return c(&fallback);
+        };
+        if buf.len() < len {
+            buf.resize(len, 0);
+        }
+        f(&mut buf[..len])?;
+        c(&buf[..len])
+    }) {
+        return res;
+    }
+    let Some((f, c)) = ops.take() else {
+        return Err(VzError::IoError);
+    };
+    let mut buf = vec![0u8; len];
+    f(&mut buf)?;
+    c(&buf)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -122,160 +161,180 @@ impl<R: RangeReader> VzReader<R> {
             );
         }
 
-        // Parallel multi-cluster decode when contiguous memory view (`Mmap`/`Vec`) is available.
+        // Contiguous multi-cluster decode: zero-copy + adaptive parallel across disjoint slices.
         if !de.is_sparse()
             && de.is_multi_cluster()
-            && raw_size >= 2 * 1024 * 1024
             && let Some(all) = self.reader.contiguous_bytes()
         {
-            let extents = self.read_chunk_table_at(data_offset, in_cluster_offset)?;
-            let total_raw = usize::try_from(raw_size).map_err(|_| VzError::ValueOverflow)?;
-            let mut sum_raw = 0usize;
-            for ext in &extents {
-                let cr = usize::try_from(ext.raw_size).map_err(|_| VzError::ValueOverflow)?;
-                sum_raw = sum_raw.checked_add(cr).ok_or(VzError::ValueOverflow)?;
-            }
-            if sum_raw != total_raw {
-                return Err(VzError::BadFormat);
-            }
-            let n_workers = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-                .min(extents.len())
-                .max(1);
-            if n_workers >= 2 {
-                out.resize(total_raw, 0);
-                let mut dest_slices: Vec<&mut [u8]> = Vec::with_capacity(extents.len());
-                let mut rest = out.as_mut_slice();
-                for ext in &extents {
-                    let cr = ext.raw_size as usize;
-                    let (head, tail) = rest.split_at_mut(cr);
-                    dest_slices.push(head);
-                    rest = tail;
-                }
-                let dicts = &self.dicts;
-                let dict_cache = &self.dict_cache;
-                let crypto = &self.crypto;
-                let run_gen = target.run_generation;
-                let entry_id = target.entry_id;
-                let next_idx = std::sync::atomic::AtomicUsize::new(0);
-                let first_err: std::sync::Mutex<Option<VzError>> = std::sync::Mutex::new(None);
-                // Pack mutable subslice pointers safely by wrapping each slice in Mutex-free per-index work.
-                let slice_cells: Vec<std::sync::Mutex<&mut [u8]>> =
-                    dest_slices.into_iter().map(std::sync::Mutex::new).collect();
-
-                std::thread::scope(|s| {
-                    for _ in 0..n_workers {
-                        s.spawn(|| {
-                            let mut dec_scratch = Vec::new();
-                            let mut plain_scratch = Vec::new();
-                            loop {
-                                let i = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if i >= extents.len() {
-                                    break;
-                                }
-                                let ext = &extents[i];
-                                let res = (|| -> Result<(), VzError> {
-                                    let slen = usize::try_from(ext.stored_size)
-                                        .map_err(|_| VzError::ValueOverflow)?;
-                                    let rlen = usize::try_from(ext.raw_size)
-                                        .map_err(|_| VzError::ValueOverflow)?;
-                                    let p_off = ext
-                                        .cluster_offset
-                                        .checked_add(ext.in_cluster_offset as u64)
-                                        .and_then(|v| usize::try_from(v).ok())
-                                        .ok_or(VzError::ValueOverflow)?;
-                                    let p_end =
-                                        p_off.checked_add(slen).ok_or(VzError::ValueOverflow)?;
-                                    let stored =
-                                        all.get(p_off..p_end).ok_or(VzError::BufferTooSmall)?;
-
-                                    let mut guard = slice_cells[i]
-                                        .lock()
-                                        .map_err(|_| VzError::IoError)?;
-                                    let dst = &mut **guard;
-
-                                    if let Some(ctx) = crypto {
-                                        let c_off = usize::try_from(ext.cluster_offset)
-                                            .map_err(|_| VzError::ValueOverflow)?;
-                                        let chdr = ClusterHeader::from_bytes(
-                                            all.get(c_off..).ok_or(VzError::BufferTooSmall)?,
-                                        )?;
-                                        if chdr.sync_magic != MAGIC_CLUSTER {
-                                            return Err(VzError::BadMagic);
-                                        }
-                                        ctx.decrypt_payload_into(
-                                            run_gen,
-                                            chdr.cluster_seq,
-                                            entry_id,
-                                            stored,
-                                            &mut dec_scratch,
-                                        )?;
-                                        if codec == crate::wire::CODEC_NONE && ext_codec.is_none() {
-                                            if dec_scratch.len() != dst.len() {
-                                                return Err(VzError::BadFormat);
-                                            }
-                                            dst.copy_from_slice(&dec_scratch);
-                                        } else {
-                                            decompress_payload_into(
-                                                &dec_scratch,
-                                                &mut plain_scratch,
-                                                rlen,
-                                                codec,
-                                                ext_codec,
-                                                dicts,
-                                                Some(dict_cache),
-                                            )?;
-                                            if plain_scratch.len() != dst.len() {
-                                                return Err(VzError::BadFormat);
-                                            }
-                                            dst.copy_from_slice(&plain_scratch);
-                                        }
-                                    } else if codec == crate::wire::CODEC_NONE
-                                        && ext_codec.is_none()
-                                    {
-                                        if stored.len() != dst.len() {
-                                            return Err(VzError::BadFormat);
-                                        }
-                                        dst.copy_from_slice(stored);
-                                    } else {
-                                        decompress_payload_into(
-                                            stored,
-                                            &mut plain_scratch,
-                                            rlen,
-                                            codec,
-                                            ext_codec,
-                                            dicts,
-                                            Some(dict_cache),
-                                        )?;
-                                        if plain_scratch.len() != dst.len() {
-                                            return Err(VzError::BadFormat);
-                                        }
-                                        dst.copy_from_slice(&plain_scratch);
-                                    }
-                                    Ok(())
-                                })();
-                                if let Err(e) = res
-                                    && let Ok(mut eg) = first_err.lock()
-                                    && eg.is_none()
-                                {
-                                    *eg = Some(e);
-                                }
-                            }
-                        });
-                    }
-                });
-                if let Ok(mut eg) = first_err.lock()
-                    && let Some(e) = eg.take()
-                {
-                    return Err(e);
-                }
-                return Ok(());
-            }
+            return self.read_multi_cluster_into(
+                all,
+                data_offset,
+                in_cluster_offset,
+                raw_size,
+                codec,
+                ext_codec,
+                target.run_generation,
+                target.entry_id,
+                out,
+            );
         }
 
-        // Sparse or multi-cluster path delegates cleanly to streaming writer.
+        // Sparse or non-contiguous multi-cluster path delegates cleanly to streaming writer.
         self.decode_ref_to_writer(&target, out).map(|_| ())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_multi_cluster_into(
+        &self,
+        all: &[u8],
+        data_offset: u64,
+        in_cluster_offset: u32,
+        raw_size: u64,
+        codec: u8,
+        ext_codec: Option<&ExtCodecMeta>,
+        generation: u64,
+        entry_id: u64,
+        out: &mut Vec<u8>,
+    ) -> Result<(), VzError> {
+        let extents = self.read_chunk_table_at(data_offset, in_cluster_offset)?;
+        let total_raw = usize::try_from(raw_size).map_err(|_| VzError::ValueOverflow)?;
+        let mut sum_raw = 0usize;
+        for ext in &extents {
+            let cr = usize::try_from(ext.raw_size).map_err(|_| VzError::ValueOverflow)?;
+            sum_raw = sum_raw.checked_add(cr).ok_or(VzError::ValueOverflow)?;
+        }
+        if sum_raw != total_raw {
+            return Err(VzError::BadFormat);
+        }
+
+        if out.is_empty() && out.capacity() < total_raw {
+            *out = vec![0u8; total_raw];
+        } else {
+            out.resize(total_raw, 0);
+        }
+
+        let dicts = &self.dicts;
+        let dict_cache = &self.dict_cache;
+        let crypto = self.crypto.as_ref();
+        let decode_chunk =
+            |ext: &ChunkExtent, dst: &mut [u8], dec_scratch: &mut Vec<u8>| -> Result<(), VzError> {
+                let slen = usize::try_from(ext.stored_size).map_err(|_| VzError::ValueOverflow)?;
+                let p_off = ext
+                    .cluster_offset
+                    .checked_add(ext.in_cluster_offset as u64)
+                    .and_then(|v| usize::try_from(v).ok())
+                    .ok_or(VzError::ValueOverflow)?;
+                let p_end = p_off.checked_add(slen).ok_or(VzError::ValueOverflow)?;
+                let stored = all.get(p_off..p_end).ok_or(VzError::BufferTooSmall)?;
+
+                if let Some(ctx) = crypto {
+                    let c_off =
+                        usize::try_from(ext.cluster_offset).map_err(|_| VzError::ValueOverflow)?;
+                    let chdr = ClusterHeader::from_bytes(
+                        all.get(c_off..).ok_or(VzError::BufferTooSmall)?,
+                    )?;
+                    if chdr.sync_magic != MAGIC_CLUSTER {
+                        return Err(VzError::BadMagic);
+                    }
+                    if codec == crate::wire::CODEC_NONE && ext_codec.is_none() {
+                        ctx.decrypt_payload_into_slice(
+                            generation,
+                            chdr.cluster_seq,
+                            entry_id,
+                            stored,
+                            dst,
+                        )?;
+                    } else {
+                        ctx.decrypt_payload_into(
+                            generation,
+                            chdr.cluster_seq,
+                            entry_id,
+                            stored,
+                            dec_scratch,
+                        )?;
+                        decompress_payload_into_slice(
+                            dec_scratch,
+                            dst,
+                            codec,
+                            ext_codec,
+                            dicts,
+                            Some(dict_cache),
+                        )?;
+                    }
+                } else {
+                    decompress_payload_into_slice(
+                        stored,
+                        dst,
+                        codec,
+                        ext_codec,
+                        dicts,
+                        Some(dict_cache),
+                    )?;
+                }
+                Ok(())
+            };
+
+        let min_bytes = if crypto.is_some()
+            || (codec != crate::wire::CODEC_NONE && codec != crate::wire::CODEC_LZ4)
+            || ext_codec.is_some()
+        {
+            512 * 1024
+        } else {
+            2 * 1024 * 1024
+        };
+        let n_workers = crate::parallel::adaptive_workers(extents.len(), total_raw, min_bytes);
+        if n_workers <= 1 {
+            let mut off = 0usize;
+            let mut dec_scratch = Vec::new();
+            for ext in &extents {
+                let rlen = ext.raw_size as usize;
+                decode_chunk(ext, &mut out[off..off + rlen], &mut dec_scratch)?;
+                off += rlen;
+            }
+            return Ok(());
+        }
+
+        let group_sz = extents.len().div_ceil(n_workers);
+        let mut tasks: Vec<(&[ChunkExtent], &mut [u8])> = Vec::with_capacity(n_workers);
+        let mut rest_out = out.as_mut_slice();
+        for ext_band in extents.chunks(group_sz) {
+            let band_bytes: usize = ext_band.iter().map(|e| e.raw_size as usize).sum();
+            let (head, tail) = rest_out.split_at_mut(band_bytes);
+            tasks.push((ext_band, head));
+            rest_out = tail;
+        }
+        let last = tasks.pop();
+        let run_band = |ext_band: &[ChunkExtent], band_out: &mut [u8]| -> Result<(), VzError> {
+            let mut off = 0usize;
+            let mut dec_scratch = Vec::new();
+            for ext in ext_band {
+                let rlen = ext.raw_size as usize;
+                decode_chunk(ext, &mut band_out[off..off + rlen], &mut dec_scratch)?;
+                off += rlen;
+            }
+            Ok(())
+        };
+
+        let results: Vec<Result<(), VzError>> = std::thread::scope(|s| {
+            let handles: Vec<_> = tasks
+                .into_iter()
+                .map(|(ext_band, band_out)| s.spawn(move || run_band(ext_band, band_out)))
+                .collect();
+            let last_res = match last {
+                Some((ext_band, band_out)) => run_band(ext_band, band_out),
+                None => Ok(()),
+            };
+            let mut res = Vec::with_capacity(handles.len() + 1);
+            for h in handles {
+                res.push(h.join().unwrap_or(Err(VzError::IoError)));
+            }
+            res.push(last_res);
+            res
+        });
+        for r in results {
+            r?;
+        }
+        Ok(())
     }
 
     /// Reads `[offset, offset + dst.len())` directly into caller-provided `dst` (clamped at EOF),
@@ -799,6 +858,30 @@ impl<R: RangeReader> VzReader<R> {
         for idx in complex_idxs {
             let entry = &live[idx];
             out_buf.clear();
+            if !entry.dir_entry.is_sparse()
+                && entry.dir_entry.is_multi_cluster()
+                && let Some(all) = contig
+                && let DirPayload::Ref {
+                    data_offset,
+                    raw_size,
+                    in_cluster_offset,
+                    ..
+                } = entry.dir_entry.payload
+            {
+                self.read_multi_cluster_into(
+                    all,
+                    data_offset,
+                    in_cluster_offset,
+                    raw_size,
+                    entry.dir_entry.codec(),
+                    entry.ext_codec.as_ref(),
+                    entry.run_generation,
+                    entry.stat.entry_id,
+                    &mut out_buf,
+                )?;
+                visitor(entry, &out_buf)?;
+                continue;
+            }
             let target = LookupTarget {
                 dir_entry: entry.dir_entry,
                 entry_id: entry.stat.entry_id,
@@ -819,6 +902,43 @@ impl<R: RangeReader> VzReader<R> {
         if let Some(inline) = resolved.dir_entry.inline_slice() {
             out.extend_from_slice(inline);
             return Ok(out);
+        }
+        if !resolved.dir_entry.is_sparse()
+            && let DirPayload::Ref {
+                data_offset,
+                stored_size,
+                raw_size,
+                in_cluster_offset,
+            } = resolved.dir_entry.payload
+        {
+            if !resolved.dir_entry.is_multi_cluster() {
+                self.read_single_cluster_payload_into(
+                    data_offset,
+                    in_cluster_offset,
+                    stored_size,
+                    raw_size,
+                    resolved.dir_entry.codec(),
+                    resolved.ext_codec.as_ref(),
+                    resolved.run_generation,
+                    resolved.stat.entry_id,
+                    &mut out,
+                )?;
+                return Ok(out);
+            }
+            if let Some(all) = self.reader.contiguous_bytes() {
+                self.read_multi_cluster_into(
+                    all,
+                    data_offset,
+                    in_cluster_offset,
+                    raw_size,
+                    resolved.dir_entry.codec(),
+                    resolved.ext_codec.as_ref(),
+                    resolved.run_generation,
+                    resolved.stat.entry_id,
+                    &mut out,
+                )?;
+                return Ok(out);
+            }
         }
         let target = LookupTarget {
             dir_entry: resolved.dir_entry,
@@ -965,38 +1085,56 @@ impl<R: RangeReader> VzReader<R> {
             }
 
             let ioff = in_cluster_offset as usize;
-            let (chdr, stored) = if (ClusterHeader::SIZE..=256).contains(&ioff) {
+            if (ClusterHeader::SIZE..=256).contains(&ioff) {
                 let total = ioff.checked_add(slen).ok_or(VzError::ValueOverflow)?;
-                let mut combined = vec![0u8; total];
-                self.reader.read_at(cluster_offset, &mut combined)?;
-                let chdr = ClusterHeader::from_bytes(&combined)?;
-                if chdr.sync_magic != MAGIC_CLUSTER {
-                    return Err(VzError::BadMagic);
-                }
-                (chdr, combined.split_off(ioff))
-            } else {
-                let mut hdr_buf = [0u8; ClusterHeader::SIZE];
-                self.reader.read_at(cluster_offset, &mut hdr_buf)?;
-                let chdr = ClusterHeader::from_bytes(&hdr_buf)?;
-                if chdr.sync_magic != MAGIC_CLUSTER {
-                    return Err(VzError::BadMagic);
-                }
-                let mut stored = vec![0u8; slen];
-                self.reader.read_at(payload_off, &mut stored)?;
-                (chdr, stored)
-            };
-            return decrypt_then_decompress_into(
-                ctx,
-                generation,
-                chdr.cluster_seq,
-                entry_id,
-                &stored,
-                out,
-                rlen,
-                codec,
-                ext_codec,
-                &self.dicts,
-                &self.dict_cache,
+                return read_with_tls_scratch(
+                    total,
+                    |buf| self.reader.read_at(cluster_offset, buf),
+                    |buf| {
+                        let chdr = ClusterHeader::from_bytes(buf)?;
+                        if chdr.sync_magic != MAGIC_CLUSTER {
+                            return Err(VzError::BadMagic);
+                        }
+                        decrypt_then_decompress_into(
+                            ctx,
+                            generation,
+                            chdr.cluster_seq,
+                            entry_id,
+                            &buf[ioff..],
+                            out,
+                            rlen,
+                            codec,
+                            ext_codec,
+                            &self.dicts,
+                            &self.dict_cache,
+                        )
+                    },
+                );
+            }
+            let mut hdr_buf = [0u8; ClusterHeader::SIZE];
+            self.reader.read_at(cluster_offset, &mut hdr_buf)?;
+            let chdr = ClusterHeader::from_bytes(&hdr_buf)?;
+            if chdr.sync_magic != MAGIC_CLUSTER {
+                return Err(VzError::BadMagic);
+            }
+            return read_with_tls_scratch(
+                slen,
+                |buf| self.reader.read_at(payload_off, buf),
+                |stored| {
+                    decrypt_then_decompress_into(
+                        ctx,
+                        generation,
+                        chdr.cluster_seq,
+                        entry_id,
+                        stored,
+                        out,
+                        rlen,
+                        codec,
+                        ext_codec,
+                        &self.dicts,
+                        &self.dict_cache,
+                    )
+                },
             );
         }
 
@@ -1005,16 +1143,20 @@ impl<R: RangeReader> VzReader<R> {
             return self.reader.read_at(payload_off, out);
         }
 
-        let mut stored = vec![0u8; slen];
-        self.reader.read_at(payload_off, &mut stored)?;
-        decompress_payload_into(
-            &stored,
-            out,
-            rlen,
-            codec,
-            ext_codec,
-            &self.dicts,
-            Some(&self.dict_cache),
+        read_with_tls_scratch(
+            slen,
+            |buf| self.reader.read_at(payload_off, buf),
+            |stored| {
+                decompress_payload_into(
+                    stored,
+                    out,
+                    rlen,
+                    codec,
+                    ext_codec,
+                    &self.dicts,
+                    Some(&self.dict_cache),
+                )
+            },
         )
     }
 
@@ -1063,6 +1205,23 @@ impl<R: RangeReader> VzReader<R> {
         cluster_offset: u64,
         in_cluster_offset: u32,
     ) -> Result<Vec<ChunkExtent>, VzError> {
+        if let Some(all) = self.reader.contiguous_bytes() {
+            let off_u = usize::try_from(cluster_offset).map_err(|_| VzError::ValueOverflow)?;
+            let chdr = ClusterHeader::from_bytes(all.get(off_u..).ok_or(VzError::BufferTooSmall)?)?;
+            let clen = usize::try_from(chdr.cluster_len).map_err(|_| VzError::ValueOverflow)?;
+            let end = off_u.checked_add(clen).ok_or(VzError::ValueOverflow)?;
+            let slice = all.get(off_u..end).ok_or(VzError::BufferTooSmall)?;
+            let (_, _, _) = validate_cluster(slice)?;
+            let rel = in_cluster_offset as usize;
+            if rel >= slice.len() {
+                return Err(VzError::BufferTooSmall);
+            }
+            let (elem, _) = crate::wire::tlv_next(&slice[rel..])?;
+            if elem.tag != TAG_CHUNK_TABLE {
+                return Err(VzError::BadFormat);
+            }
+            return decode_chunk_table(elem.value);
+        }
         let cluster_buf = read_cluster_at(&self.reader, cluster_offset)?;
         let (_, _, _) = validate_cluster(&cluster_buf)?;
         let rel = in_cluster_offset as usize;

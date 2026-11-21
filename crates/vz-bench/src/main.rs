@@ -362,6 +362,10 @@ fn write_temp_file(bytes: &[u8]) -> Result<NamedTempFile, Box<dyn std::error::Er
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== VZ vs TAR / TAR.GZ / TAR.LZ4 / TAR.ZST / ZIP Standalone Comparison ===");
     println!("crc32c_hw_active: {}", crc32c_hw_active());
+    let max_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    println!("available_parallelism: {max_threads}");
     let dict = build_dict_bytes();
 
     let all_formats = [
@@ -1045,7 +1049,9 @@ fn percentile_us(sorted_ns: &[u64], pct: f64) -> f64 {
 #[derive(Clone, Copy)]
 enum IopsTarget {
     VzNoneFile,
+    VzNoneMmap,
     VzLz4File,
+    VzLz4Mmap,
     VzZstdFile,
     VzZstdMmap,
     ZipStored,
@@ -1056,7 +1062,9 @@ impl IopsTarget {
     fn label(self) -> &'static str {
         match self {
             Self::VzNoneFile => "VZ (None, File pread)",
+            Self::VzNoneMmap => "VZ (None, Mmap)",
             Self::VzLz4File => "VZ (LZ4, File pread)",
+            Self::VzLz4Mmap => "VZ (LZ4, Mmap)",
             Self::VzZstdFile => "VZ (Zstd, File pread)",
             Self::VzZstdMmap => "VZ (Zstd, Mmap)",
             Self::ZipStored => "ZIP (Stored, File)",
@@ -1081,7 +1089,10 @@ fn run_iops_bench(
         }
         _ => None,
     };
-    let vz_mmap_reader = if matches!(target, IopsTarget::VzZstdMmap) {
+    let vz_mmap_reader = if matches!(
+        target,
+        IopsTarget::VzNoneMmap | IopsTarget::VzLz4Mmap | IopsTarget::VzZstdMmap
+    ) {
         let mmap = unsafe { MmapRangeReader::from_file(&file)? };
         Some(Arc::new(VzReader::open(mmap)?))
     } else {
@@ -1240,10 +1251,22 @@ fn run_extended_benchmarks(
     }
 
     // =========================================================================
-    // [7] RANDOM I/O & IOPS (20,000-FILE ARCHIVE ON DISK: 1-THREAD & 6-THREAD)
+    // [7] RANDOM I/O & IOPS (20,000-FILE ARCHIVE ON DISK: 1T, 6T, & MAX PARALLELISM)
     // =========================================================================
+    let max_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let max_ops = (max_threads * 5_000).max(30_000);
     println!();
-    println!("[7] Random I/O & IOPS (20,000-file archive: 1T x 10,000 reads, 6T x 30,000 total reads)");
+    println!(
+        "[7] Random I/O & IOPS (20,000-file archive: 1T x 10,000 reads{}{})",
+        if max_threads >= 6 { ", 6T x 30,000" } else { "" },
+        if max_threads > 1 && max_threads != 6 {
+            format!(", {max_threads}T x {max_ops}")
+        } else {
+            String::new()
+        }
+    );
     let corpus_20k = gen_mixed_corpus(20_000);
     let paths_20k: Vec<String> = corpus_20k.iter().map(|(p, _)| p.clone()).collect();
 
@@ -1254,32 +1277,75 @@ fn run_extended_benchmarks(
     let f_zip_zstd = write_temp_file(&pack_format_to_vec(FormatKind::ZipZstd, &corpus_20k, dict)?)?;
     let f_tar_zst = write_temp_file(&pack_format_to_vec(FormatKind::TarZst, &corpus_20k, dict)?)?;
 
-    println!(
-        "{:<22} | {:>11} | {:>7} | {:>7} | {:>11} | {:>7} | {:>7}",
-        "Format", "1T IOPS", "p50 us", "p99 us", "6T IOPS", "p50 us", "p99 us"
-    );
-    println!("{}", "-".repeat(86));
-
-    for (target, tf) in [
+    let iops_targets = [
         (IopsTarget::VzNoneFile, &f_vz_none),
+        (IopsTarget::VzNoneMmap, &f_vz_none),
         (IopsTarget::VzLz4File, &f_vz_lz4),
+        (IopsTarget::VzLz4Mmap, &f_vz_lz4),
         (IopsTarget::VzZstdFile, &f_vz_zstd),
         (IopsTarget::VzZstdMmap, &f_vz_zstd),
         (IopsTarget::ZipStored, &f_zip_stored),
         (IopsTarget::ZipZstd, &f_zip_zstd),
-    ] {
-        let (iops1, p50_1, p99_1) = run_iops_bench(target, tf.path(), &paths_20k, 1, 10_000)?;
-        let (iops6, p50_6, p99_6) = run_iops_bench(target, tf.path(), &paths_20k, 6, 30_000)?;
+    ];
+
+    if max_threads > 6 {
+        let max_col = format!("{max_threads}T IOPS");
         println!(
-            "{:<22} | {:>11.0} | {:>7.2} | {:>7.2} | {:>11.0} | {:>7.2} | {:>7.2}",
-            target.label(),
-            iops1,
-            p50_1,
-            p99_1,
-            iops6,
-            p50_6,
-            p99_6
+            "{:<22} | {:>11} | {:>7} | {:>7} | {:>11} | {:>7} | {:>7} | {:>11} | {:>7} | {:>7} | {:>7}",
+            "Format", "1T IOPS", "p50 us", "p99 us", "6T IOPS", "p50 us", "p99 us", max_col, "p50 us", "p99 us", "Scale"
         );
+        println!("{}", "-".repeat(126));
+        for (target, tf) in iops_targets {
+            let (iops1, p50_1, p99_1) = run_iops_bench(target, tf.path(), &paths_20k, 1, 10_000)?;
+            let (iops6, p50_6, p99_6) = run_iops_bench(target, tf.path(), &paths_20k, 6, 30_000)?;
+            let (iopsm, p50_m, p99_m) =
+                run_iops_bench(target, tf.path(), &paths_20k, max_threads, max_ops)?;
+            println!(
+                "{:<22} | {:>11.0} | {:>7.2} | {:>7.2} | {:>11.0} | {:>7.2} | {:>7.2} | {:>11.0} | {:>7.2} | {:>7.2} | {:>6.2}x",
+                target.label(),
+                iops1, p50_1, p99_1,
+                iops6, p50_6, p99_6,
+                iopsm, p50_m, p99_m,
+                iopsm / iops1.max(1.0)
+            );
+        }
+    } else if max_threads > 1 {
+        let par_threads = max_threads;
+        let par_ops = if par_threads == 6 { 30_000 } else { max_ops };
+        let par_col = format!("{par_threads}T IOPS");
+        println!(
+            "{:<22} | {:>11} | {:>7} | {:>7} | {:>11} | {:>7} | {:>7} | {:>7}",
+            "Format", "1T IOPS", "p50 us", "p99 us", par_col, "p50 us", "p99 us", "Scale"
+        );
+        println!("{}", "-".repeat(96));
+        for (target, tf) in iops_targets {
+            let (iops1, p50_1, p99_1) = run_iops_bench(target, tf.path(), &paths_20k, 1, 10_000)?;
+            let (iopsp, p50_p, p99_p) =
+                run_iops_bench(target, tf.path(), &paths_20k, par_threads, par_ops)?;
+            println!(
+                "{:<22} | {:>11.0} | {:>7.2} | {:>7.2} | {:>11.0} | {:>7.2} | {:>7.2} | {:>6.2}x",
+                target.label(),
+                iops1, p50_1, p99_1,
+                iopsp, p50_p, p99_p,
+                iopsp / iops1.max(1.0)
+            );
+        }
+    } else {
+        println!(
+            "{:<22} | {:>11} | {:>7} | {:>7}",
+            "Format", "1T IOPS", "p50 us", "p99 us"
+        );
+        println!("{}", "-".repeat(56));
+        for (target, tf) in iops_targets {
+            let (iops1, p50_1, p99_1) = run_iops_bench(target, tf.path(), &paths_20k, 1, 10_000)?;
+            println!(
+                "{:<22} | {:>11.0} | {:>7.2} | {:>7.2}",
+                target.label(),
+                iops1,
+                p50_1,
+                p99_1
+            );
+        }
     }
 
     // TAR.ZST sequential scan baseline (10 samples at ~50% depth so it finishes fast)
@@ -1295,16 +1361,33 @@ fn run_extended_benchmarks(
         }
         let dt = t0.elapsed().as_secs_f64();
         lats.sort_unstable();
-        println!(
-            "{:<22} | {:>11.1} | {:>7.0} | {:>7.0} | {:>11} | {:>7} | {:>7}",
-            "TAR.ZST (10-op sample)",
-            10.0 / dt,
-            percentile_us(&lats, 0.50),
-            percentile_us(&lats, 0.99),
-            "N/A",
-            "-",
-            "-"
-        );
+        if max_threads > 6 {
+            println!(
+                "{:<22} | {:>11.1} | {:>7.0} | {:>7.0} | {:>11} | {:>7} | {:>7} | {:>11} | {:>7} | {:>7} | {:>7}",
+                "TAR.ZST (10-op sample)",
+                10.0 / dt,
+                percentile_us(&lats, 0.50),
+                percentile_us(&lats, 0.99),
+                "N/A", "-", "-", "N/A", "-", "-", "-"
+            );
+        } else if max_threads > 1 {
+            println!(
+                "{:<22} | {:>11.1} | {:>7.0} | {:>7.0} | {:>11} | {:>7} | {:>7} | {:>7}",
+                "TAR.ZST (10-op sample)",
+                10.0 / dt,
+                percentile_us(&lats, 0.50),
+                percentile_us(&lats, 0.99),
+                "N/A", "-", "-", "-"
+            );
+        } else {
+            println!(
+                "{:<22} | {:>11.1} | {:>7.0} | {:>7.0}",
+                "TAR.ZST (10-op sample)",
+                10.0 / dt,
+                percentile_us(&lats, 0.50),
+                percentile_us(&lats, 0.99),
+            );
+        }
     }
 
     // =========================================================================

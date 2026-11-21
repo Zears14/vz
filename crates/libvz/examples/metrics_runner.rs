@@ -105,6 +105,10 @@ fn compressible_payload(seed: usize, len: usize) -> Vec<u8> {
 fn main() {
     println!("=== VZ Multi-Metric Release Benchmark Runner ===");
     println!("crc32c_hw_active: {}", crc32c_hw_active());
+    let max_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    println!("available_parallelism: {max_threads}");
 
     // 1. Primitives
     println!("\n[1] Primitive Throughput");
@@ -803,5 +807,92 @@ fn main() {
         println!(
             "4 KiB sparse hole read: reads={hole_reads}, bytes={hole_bytes} (zero-I/O fast path)"
         );
+    }
+
+    // 8. Multi-Threaded Random I/O Scaling (1T vs max_threads)
+    println!(
+        "\n[8] Multi-Threaded Random I/O Scaling (10,000 files, 1T vs {max_threads}T)"
+    );
+    {
+        fn bench_reader_iops<R: libvz::RangeReader + Send + Sync>(
+            reader: &Arc<VzReader<R>>,
+            paths: &[String],
+            threads: usize,
+            total_ops: usize,
+        ) -> f64 {
+            let ops_per_thread = (total_ops / threads).max(1);
+            let t0 = Instant::now();
+            std::thread::scope(|s| {
+                for tid in 0..threads {
+                    let vr = Arc::clone(reader);
+                    s.spawn(move || {
+                        let mut state =
+                            0x9E37_79B9_7F4A_7C15u64 ^ ((tid as u64 + 1) * 0xBF58_476D_1CE4_E5B9);
+                        let mut scratch = Vec::with_capacity(8192);
+                        for _ in 0..ops_per_thread {
+                            state ^= state << 13;
+                            state ^= state >> 7;
+                            state ^= state << 17;
+                            let idx = (state as usize) % paths.len();
+                            vr.read_file_into(&paths[idx], &mut scratch).unwrap();
+                            black_box(scratch.len());
+                        }
+                    });
+                }
+            });
+            (ops_per_thread * threads) as f64 / t0.elapsed().as_secs_f64()
+        }
+
+        let mut paths_10k = Vec::with_capacity(10_000);
+        let mut blobs_10k = Vec::with_capacity(10_000);
+        for i in 0..10_000 {
+            paths_10k.push(format!("/scale/{:02}/f_{i:05}.bin", i % 64));
+            blobs_10k.push(compressible_payload(i, 256 + ((i * 97) % 3840)));
+        }
+
+        let max_ops = (max_threads * 5_000).max(30_000);
+        for (label, codec) in [
+            ("None", CODEC_NONE),
+            ("LZ4 ", CODEC_LZ4),
+            ("Zstd", CODEC_ZSTD),
+        ] {
+            let tf = tempfile::NamedTempFile::new().unwrap();
+            {
+                let mut w = VzWriter::new(
+                    tf.reopen().unwrap(),
+                    VzWriterConfig {
+                        default_codec: codec,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let batch_opts = EntryOptions::default();
+                let batch: Vec<(&str, &[u8], &EntryOptions)> = paths_10k
+                    .iter()
+                    .zip(blobs_10k.iter())
+                    .map(|(p, b)| (p.as_str(), b.as_slice(), &batch_opts))
+                    .collect();
+                w.add_files_batch(&batch).unwrap();
+                w.finish().unwrap();
+            }
+
+            let file_reader = Arc::new(VzReader::open(tf.reopen().unwrap()).unwrap());
+            let mmap = unsafe { MmapRangeReader::from_file(&tf.reopen().unwrap()).unwrap() };
+            let mmap_reader = Arc::new(VzReader::open(mmap).unwrap());
+
+            let f1 = bench_reader_iops(&file_reader, &paths_10k, 1, 10_000);
+            let m1 = bench_reader_iops(&mmap_reader, &paths_10k, 1, 10_000);
+            if max_threads > 1 {
+                let fm = bench_reader_iops(&file_reader, &paths_10k, max_threads, max_ops);
+                let mm = bench_reader_iops(&mmap_reader, &paths_10k, max_threads, max_ops);
+                println!(
+                    "VZ {label}: File 1T={f1:.0} -> {max_threads}T={fm:.0} IOPS ({:.2}x) | Mmap 1T={m1:.0} -> {max_threads}T={mm:.0} IOPS ({:.2}x)",
+                    fm / f1.max(1.0),
+                    mm / m1.max(1.0)
+                );
+            } else {
+                println!("VZ {label}: File 1T={f1:.0} IOPS | Mmap 1T={m1:.0} IOPS");
+            }
+        }
     }
 }

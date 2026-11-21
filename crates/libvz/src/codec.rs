@@ -1049,6 +1049,56 @@ impl CryptoContext {
         Err(VzError::Unsupported)
     }
 
+    /// Encrypts `plaintext` with `XChaCha20-Poly1305` directly into pre-sized destination slice
+    /// `dst` (`dst.len() == plaintext.len() + 40`), writing `[24B nonce][ciphertext][16B tag]`
+    /// with zero heap allocations.
+    #[cfg(feature = "crypto")]
+    pub fn encrypt_payload_into_slice(
+        &self,
+        generation: u64,
+        cluster_seq: u64,
+        entry_id: u64,
+        plaintext: &[u8],
+        dst: &mut [u8],
+    ) -> Result<(), VzError> {
+        use chacha20poly1305::aead::AeadInPlace;
+
+        let expected_len = plaintext
+            .len()
+            .checked_add(40)
+            .ok_or(VzError::ValueOverflow)?;
+        if dst.len() != expected_len {
+            return Err(VzError::BufferTooSmall);
+        }
+        let mut nonce = [0u8; 24];
+        fill_csprng_nonce(&mut nonce);
+        let aad = build_payload_aad(generation, cluster_seq, entry_id);
+        let ct_end = 24 + plaintext.len();
+        dst[..24].copy_from_slice(&nonce);
+        dst[24..ct_end].copy_from_slice(plaintext);
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached((&nonce).into(), &aad, &mut dst[24..ct_end])
+            .map_err(|_| {
+                dst.fill(0);
+                VzError::CryptoError
+            })?;
+        dst[ct_end..].copy_from_slice(&tag);
+        Ok(())
+    }
+
+    #[cfg(not(feature = "crypto"))]
+    pub fn encrypt_payload_into_slice(
+        &self,
+        _generation: u64,
+        _cluster_seq: u64,
+        _entry_id: u64,
+        _plaintext: &[u8],
+        _dst: &mut [u8],
+    ) -> Result<(), VzError> {
+        Err(VzError::Unsupported)
+    }
+
     /// Encrypts `plaintext` with `XChaCha20-Poly1305` into `out` (clearing `out` first).
     #[cfg(feature = "crypto")]
     pub fn encrypt_payload_into(
@@ -1396,5 +1446,27 @@ mod tests {
             fill_csprng_nonce(&mut n);
             assert!(seen.insert(n), "duplicate CSPRNG nonce generated");
         }
+    }
+
+    #[cfg(feature = "crypto")]
+    #[test]
+    fn test_encrypt_payload_into_slice_roundtrip_and_len_check() {
+        let key = EncryptionKey::Raw256([0x5Au8; 32]);
+        let (_hdr, ctx) = CryptoContext::create(&key).unwrap();
+        for &sz in &[0usize, 1, 63, 4097, 65_536] {
+            let plain: Vec<u8> = (0..sz).map(|i| ((i * 11 + 3) & 0xFF) as u8).collect();
+            let mut enc = vec![0u8; sz + 40];
+            ctx.encrypt_payload_into_slice(1, 7, 42, &plain, &mut enc)
+                .unwrap();
+            let mut dec = vec![0u8; sz];
+            ctx.decrypt_payload_into_slice(1, 7, 42, &enc, &mut dec)
+                .unwrap();
+            assert_eq!(dec, plain);
+        }
+        let mut bad = vec![0u8; 10];
+        assert_eq!(
+            ctx.encrypt_payload_into_slice(1, 7, 42, b"hello", &mut bad),
+            Err(VzError::BufferTooSmall)
+        );
     }
 }

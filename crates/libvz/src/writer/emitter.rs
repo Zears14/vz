@@ -353,7 +353,7 @@ impl<W: Write> ClusterEmitter<W> {
         Ok((cluster_off, in_cluster_offset, seq))
     }
 
-    /// Writes a dedicated standalone cluster containing a single `TAG_DATA_MANIFEST` (for multi-cluster chunks).
+    /// Writes a standalone cluster containing a single `TAG_DATA_MANIFEST` (for multi-cluster chunks).
     pub(super) fn emit_dedicated_data_cluster(
         &mut self,
         entry_id: u64,
@@ -361,12 +361,25 @@ impl<W: Write> ClusterEmitter<W> {
         stored_payload: &[u8],
         col_stats: Option<&ColChunkStats>,
     ) -> Result<(u64, u32, u64), VzError> {
+        self.emit_dedicated_data_cluster_with_crc(entry_id, raw_size, stored_payload, col_stats, None)
+    }
+
+    /// Writes a standalone cluster containing a single `TAG_DATA_MANIFEST`, reusing
+    /// `precomputed_payload_crc` when workers already computed CRC32C of `stored_payload`.
+    pub(super) fn emit_dedicated_data_cluster_with_crc(
+        &mut self,
+        entry_id: u64,
+        raw_size: u64,
+        stored_payload: &[u8],
+        col_stats: Option<&ColChunkStats>,
+        precomputed_payload_crc: Option<u32>,
+    ) -> Result<(u64, u32, u64), VzError> {
         self.flush_pending_data_cluster()?;
         let stats_bytes = encode_col_chunk_stats(col_stats)?;
         let manifest_flags: u16 = 0x0002 | u16::from(col_stats.is_some());
         let cluster_off = self.current_offset;
         let seq = self.cluster_seq;
-        let payload_crc = crc32c(stored_payload);
+        let payload_crc = precomputed_payload_crc.unwrap_or_else(|| crc32c(stored_payload));
 
         let mut head = Vec::with_capacity(ClusterHeader::SIZE + 128 + stats_bytes.len());
         head.resize(ClusterHeader::SIZE, 0);

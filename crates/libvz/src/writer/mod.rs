@@ -883,64 +883,74 @@ impl<W: Write + Seek> VzWriter<W> {
         let dict_cache = &self.dict_cache;
         let zstd_level = self.config.zstd_level;
 
-        type BatchGroupOut = Vec<Option<Result<Vec<u8>, VzError>>>;
-        let group_size = items.len().div_ceil(worker_count);
-        let group_results: Vec<BatchGroupOut> = std::thread::scope(|s| {
-            let handles: Vec<_> = items
-                .chunks(group_size)
-                .map(|chunk| {
-                    s.spawn(move || {
-                        let mut out = Vec::with_capacity(chunk.len());
-                        for &(_path, data, opts) in chunk {
-                            let is_special = matches!(
-                                opts.kind & KIND_MASK,
-                                KIND_DIR
-                                    | crate::wire::KIND_FIFO
-                                    | crate::wire::KIND_CHR
-                                    | crate::wire::KIND_BLK
-                                    | crate::wire::KIND_SOCK
-                            );
-                            let codec = opts.codec.unwrap_or(default_codec) & CODEC_MASK;
-                            let ext_codec = opts.dict_id.map(|dict_id| ExtCodecMeta {
-                                ext_codec_id: EXT_CODEC_ZSTD_DICT,
-                                dict_id,
-                                params: Vec::new(),
-                            });
-                            let effective_codec =
-                                if ext_codec.is_some() { CODEC_EXT } else { codec };
-                            if !is_special
-                                && opts.sparse.is_none()
-                                && effective_codec != CODEC_NONE
-                                && (is_encrypted || data.len() > 27)
-                                && data.len() <= multi_thresh
-                            {
-                                out.push(Some(compress_payload_with_cache(
-                                    data,
-                                    effective_codec,
-                                    ext_codec.as_ref(),
-                                    dicts,
-                                    Some(dict_cache),
-                                    zstd_level,
-                                )));
-                            } else {
-                                out.push(None);
-                            }
-                        }
-                        out
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap_or_default())
-                .collect()
-        });
+        struct CompressedBatchChunk {
+            arena: Vec<u8>,
+            ranges: Vec<Option<(usize, usize)>>,
+        }
 
-        let mut iter = group_results.into_iter().flatten();
+        let target_groups = worker_count.saturating_mul(2).min(items.len()).max(1);
+        let group_size = items.len().div_ceil(target_groups);
+        let batch_groups: Vec<&[(&'a str, &'a [u8], &'a EntryOptions)]> =
+            items.chunks(group_size).collect();
+        let group_results = crate::parallel::par_try_map(
+            batch_groups,
+            worker_count,
+            |chunk| -> Result<CompressedBatchChunk, VzError> {
+                let est_arena: usize = chunk
+                    .iter()
+                    .map(|&(_, d, _)| d.len() / 2 + 64)
+                    .sum();
+                let mut arena = Vec::with_capacity(est_arena);
+                let mut ranges = Vec::with_capacity(chunk.len());
+                let mut scratch = Vec::new();
+                for &(_path, data, opts) in chunk {
+                    let is_special = matches!(
+                        opts.kind & KIND_MASK,
+                        KIND_DIR
+                            | crate::wire::KIND_FIFO
+                            | crate::wire::KIND_CHR
+                            | crate::wire::KIND_BLK
+                            | crate::wire::KIND_SOCK
+                    );
+                    let codec = opts.codec.unwrap_or(default_codec) & CODEC_MASK;
+                    let ext_codec = opts.dict_id.map(|dict_id| ExtCodecMeta {
+                        ext_codec_id: EXT_CODEC_ZSTD_DICT,
+                        dict_id,
+                        params: Vec::new(),
+                    });
+                    let effective_codec =
+                        if ext_codec.is_some() { CODEC_EXT } else { codec };
+                    if !is_special
+                        && opts.sparse.is_none()
+                        && effective_codec != CODEC_NONE
+                        && (is_encrypted || data.len() > 27)
+                        && data.len() <= multi_thresh
+                    {
+                        compress_payload_into_with_cache(
+                            data,
+                            &mut scratch,
+                            effective_codec,
+                            ext_codec.as_ref(),
+                            dicts,
+                            Some(dict_cache),
+                            zstd_level,
+                        )?;
+                        let start = arena.len();
+                        arena.extend_from_slice(&scratch);
+                        ranges.push(Some((start, arena.len())));
+                    } else {
+                        ranges.push(None);
+                    }
+                }
+                Ok(CompressedBatchChunk { arena, ranges })
+            },
+        )?;
+
+        let mut flat_ranges = group_results
+            .iter()
+            .flat_map(|grp| grp.ranges.iter().map(|r| r.map(|(s, e)| &grp.arena[s..e])));
         for &(path, data, opts) in items {
-            let pre = iter.next().flatten();
-            if let Some(comp_res) = pre {
-                let compressed = comp_res?;
+            if let Some(compressed) = flat_ranges.next().flatten() {
                 let (parent_cow, base_cow) = split_archive_path_borrowed(path)?;
                 let parent_hash = self.hash_parent_cached(&parent_cow)?;
                 let name_hash = self.hasher.hash(base_cow.as_bytes())?;
@@ -962,7 +972,7 @@ impl<W: Write + Seek> VzWriter<W> {
                     entry_id,
                     data.len() as u64,
                     effective_codec,
-                    &compressed,
+                    compressed,
                     opts.col_stats.as_ref(),
                 )?;
                 flags_and_codec |= extra_flags;
@@ -1047,7 +1057,7 @@ impl<W: Write + Seek> VzWriter<W> {
                 in_cluster_offset: 0,
             }
         } else if !is_sparse && data.len() > self.config.multi_cluster_threshold {
-            // Multi-cluster chunking for large in-memory blobs (compress + encrypt in parallel).
+            // Multi-cluster chunking for large in-memory blobs (compress + encrypt + CRC32C in parallel).
             self.emitter.flush_pending_data_cluster()?;
             let chunk_cap = self.config.target_cluster_size.max(4096);
             let chunks: Vec<&[u8]> = data.chunks(chunk_cap).collect();
@@ -1064,7 +1074,90 @@ impl<W: Write + Seek> VzWriter<W> {
                 1
             };
 
-            let encoded_chunks: Option<Vec<Vec<u8>>> = if worker_count >= 2 {
+            let mut extents = Vec::with_capacity(chunks.len());
+            let mut total_stored = 0u64;
+
+            if worker_count >= 2 && effective_codec == CODEC_NONE && self.crypto.is_some() {
+                let n_chunks = chunks.len();
+                let total_ct = data
+                    .len()
+                    .checked_add(n_chunks.checked_mul(40).ok_or(VzError::ValueOverflow)?)
+                    .ok_or(VzError::ValueOverflow)?;
+                let mut flat_ct = vec![0u8; total_ct];
+                let seqs: Vec<u64> = (0..n_chunks)
+                    .map(|i| self.emitter.next_data_cluster_seq(i))
+                    .collect();
+                let target_groups = if n_chunks <= 64 {
+                    n_chunks
+                } else {
+                    worker_count.saturating_mul(2).min(n_chunks)
+                }
+                .max(1);
+                let group_sz = n_chunks.div_ceil(target_groups);
+                type FlatEncryptTask<'a> = (&'a [&'a [u8]], &'a [u64], &'a mut [u8]);
+                let mut tasks: Vec<FlatEncryptTask<'_>> = Vec::with_capacity(target_groups);
+                let mut rest_ct = flat_ct.as_mut_slice();
+                for (c_grp, s_grp) in chunks.chunks(group_sz).zip(seqs.chunks(group_sz)) {
+                    let band_ct: usize = c_grp.iter().map(|c| c.len() + 40).sum();
+                    let (head, tail) = rest_ct.split_at_mut(band_ct);
+                    tasks.push((c_grp, s_grp, head));
+                    rest_ct = tail;
+                }
+                let ctx = self
+                    .crypto
+                    .as_ref()
+                    .map(|(_, c)| c)
+                    .ok_or(VzError::CryptoError)?;
+                let crc_groups = crate::parallel::par_try_map(
+                    tasks,
+                    worker_count,
+                    |(c_grp, s_grp, dst_band)| -> Result<Vec<u32>, VzError> {
+                        let mut crcs = Vec::with_capacity(c_grp.len());
+                        let mut pos = 0usize;
+                        for (&chunk, &seq) in c_grp.iter().zip(s_grp.iter()) {
+                            let ct_len = chunk.len() + 40;
+                            let dst = &mut dst_band[pos..pos + ct_len];
+                            ctx.encrypt_payload_into_slice(target_gen, seq, entry_id, chunk, dst)?;
+                            crcs.push(crate::crc::crc32c(dst));
+                            pos += ct_len;
+                        }
+                        Ok(crcs)
+                    },
+                )?;
+                let mut cur_off = 0usize;
+                for (&chunk, crc) in chunks.iter().zip(crc_groups.into_iter().flatten()) {
+                    let ct_len = chunk.len() + 40;
+                    let stored = &flat_ct[cur_off..cur_off + ct_len];
+                    cur_off += ct_len;
+                    let seq = self.emitter.cluster_seq;
+                    let (cluster_offset, in_cluster_offset, actual_seq) =
+                        self.emitter.emit_dedicated_data_cluster_with_crc(
+                            entry_id,
+                            chunk.len() as u64,
+                            stored,
+                            opts.col_stats.as_ref(),
+                            Some(crc),
+                        )?;
+                    if actual_seq != seq {
+                        return Err(VzError::BadFormat);
+                    }
+                    let stored_len = ct_len as u64;
+                    total_stored = total_stored
+                        .checked_add(stored_len)
+                        .ok_or(VzError::ValueOverflow)?;
+                    extents.push(ChunkExtent {
+                        cluster_offset,
+                        in_cluster_offset,
+                        stored_size: stored_len,
+                        raw_size: chunk.len() as u64,
+                    });
+                }
+            } else if worker_count >= 2 {
+                struct EncodedMultiGroup {
+                    arena: Vec<u8>,
+                    entries: Vec<(usize, usize, u32)>,
+                }
+
                 let seqs: Vec<u64> = (0..chunks.len())
                     .map(|i| self.emitter.next_data_cluster_seq(i))
                     .collect();
@@ -1073,156 +1166,169 @@ impl<W: Write + Seek> VzWriter<W> {
                 let zstd_level = self.config.zstd_level;
                 let crypto = self.crypto.as_ref().map(|(_, c)| c);
                 let ext_codec_ref = ext_codec.as_ref();
-                let group_sz = chunks.len().div_ceil(worker_count);
-
-                let group_results: Vec<Result<Vec<Vec<u8>>, VzError>> = std::thread::scope(|s| {
-                    let handles: Vec<_> = chunks
-                        .chunks(group_sz)
-                        .zip(seqs.chunks(group_sz))
-                        .map(|(chunk_grp, seq_grp)| {
-                            s.spawn(move || -> Result<Vec<Vec<u8>>, VzError> {
-                                let mut grp_out = Vec::with_capacity(chunk_grp.len());
-                                let mut comp_scratch = Vec::new();
-                                for (&chunk, &seq) in chunk_grp.iter().zip(seq_grp.iter()) {
-                                    if effective_codec == CODEC_NONE {
-                                        let buf = match crypto {
-                                            Some(ctx) => ctx.encrypt_payload(
-                                                target_gen, seq, entry_id, chunk,
-                                            )?,
-                                            None => chunk.to_vec(),
-                                        };
-                                        grp_out.push(buf);
-                                    } else if let Some(ctx) = crypto {
-                                        compress_payload_into_with_cache(
-                                            chunk,
-                                            &mut comp_scratch,
-                                            effective_codec,
-                                            ext_codec_ref,
-                                            dicts,
-                                            Some(dict_cache),
-                                            zstd_level,
-                                        )?;
-                                        grp_out.push(ctx.encrypt_payload(
-                                            target_gen,
-                                            seq,
-                                            entry_id,
-                                            &comp_scratch,
-                                        )?);
-                                    } else {
-                                        grp_out.push(compress_payload_with_cache(
-                                            chunk,
-                                            effective_codec,
-                                            ext_codec_ref,
-                                            dicts,
-                                            Some(dict_cache),
-                                            zstd_level,
-                                        )?);
-                                    }
-                                }
-                                Ok(grp_out)
-                            })
-                        })
-                        .collect();
-                    handles
-                        .into_iter()
-                        .map(|h| h.join().map_err(|_| VzError::IoError).and_then(|r| r))
-                        .collect()
-                });
-                let mut out = Vec::with_capacity(chunks.len());
-                for grp in group_results {
-                    out.extend(grp?);
+                let target_groups = if chunks.len() <= 64 {
+                    chunks.len()
+                } else {
+                    worker_count.saturating_mul(2).min(chunks.len())
                 }
-                Some(out)
-            } else {
-                None
-            };
+                .max(1);
+                let group_sz = chunks.len().div_ceil(target_groups);
+                let tasks: Vec<(&[&[u8]], &[u64])> = chunks
+                    .chunks(group_sz)
+                    .zip(seqs.chunks(group_sz))
+                    .collect();
 
-            let mut extents = Vec::with_capacity(chunks.len());
-            let mut total_stored = 0u64;
-            for (idx, &chunk) in chunks.iter().enumerate() {
-                let seq = self.emitter.cluster_seq;
-                let (cluster_offset, in_cluster_offset, actual_seq, stored_len) =
-                    if let Some(ref pre) = encoded_chunks {
-                        let stored = &pre[idx];
-                        let (c, i, s) = self.emitter.emit_dedicated_data_cluster(
+                let group_results = crate::parallel::par_try_map(
+                    tasks,
+                    worker_count,
+                    |(chunk_grp, seq_grp)| -> Result<EncodedMultiGroup, VzError> {
+                        let mut grp_out = EncodedMultiGroup {
+                            arena: Vec::new(),
+                            entries: Vec::with_capacity(chunk_grp.len()),
+                        };
+                        let mut comp_scratch = Vec::new();
+                        let mut enc_scratch = Vec::new();
+                        for (&chunk, &seq) in chunk_grp.iter().zip(seq_grp.iter()) {
+                            compress_payload_into_with_cache(
+                                chunk,
+                                &mut comp_scratch,
+                                effective_codec,
+                                ext_codec_ref,
+                                dicts,
+                                Some(dict_cache),
+                                zstd_level,
+                            )?;
+                            let stored: &[u8] = if let Some(ctx) = crypto {
+                                ctx.encrypt_payload_into(
+                                    target_gen,
+                                    seq,
+                                    entry_id,
+                                    &comp_scratch,
+                                    &mut enc_scratch,
+                                )?;
+                                &enc_scratch
+                            } else {
+                                &comp_scratch
+                            };
+                            let crc = crate::crc::crc32c(stored);
+                            let start = grp_out.arena.len();
+                            grp_out.arena.extend_from_slice(stored);
+                            grp_out.entries.push((start, grp_out.arena.len(), crc));
+                        }
+                        Ok(grp_out)
+                    },
+                )?;
+
+                let mut pre_iter = group_results
+                    .iter()
+                    .flat_map(|g| g.entries.iter().map(|&(s, e, crc)| (&g.arena[s..e], crc)));
+                for &chunk in &chunks {
+                    let (stored, crc) = pre_iter.next().ok_or(VzError::BadFormat)?;
+                    let seq = self.emitter.cluster_seq;
+                    let (cluster_offset, in_cluster_offset, actual_seq) =
+                        self.emitter.emit_dedicated_data_cluster_with_crc(
                             entry_id,
                             chunk.len() as u64,
                             stored,
                             opts.col_stats.as_ref(),
+                            Some(crc),
                         )?;
-                        (c, i, s, stored.len() as u64)
-                    } else if effective_codec == CODEC_NONE && self.crypto.is_none() {
-                        let (c, i, s) = self.emitter.emit_dedicated_data_cluster(
-                            entry_id,
-                            chunk.len() as u64,
-                            chunk,
-                            opts.col_stats.as_ref(),
-                        )?;
-                        (c, i, s, chunk.len() as u64)
-                    } else {
-                        let mut scratch = core::mem::take(&mut self.compress_scratch);
-                        let src_ref: &[u8] = if effective_codec == CODEC_NONE {
-                            chunk
-                        } else {
-                            let res = compress_payload_into_with_cache(
-                                chunk,
-                                &mut scratch,
-                                effective_codec,
-                                ext_codec.as_ref(),
-                                &self.config.dicts,
-                                Some(&self.dict_cache),
-                                self.config.zstd_level,
-                            );
-                            if let Err(e) = res {
-                                self.compress_scratch = scratch;
-                                return Err(e);
-                            }
-                            &scratch
-                        };
-                        let emit_res = if let Some((_, ref ctx)) = self.crypto {
-                            let mut enc = core::mem::take(&mut self.encrypt_scratch);
-                            let er =
-                                ctx.encrypt_payload_into(target_gen, seq, entry_id, src_ref, &mut enc);
-                            if let Err(e) = er {
-                                self.encrypt_scratch = enc;
-                                self.compress_scratch = scratch;
-                                return Err(e);
-                            }
-                            let slen = enc.len() as u64;
-                            let r = self.emitter.emit_dedicated_data_cluster(
+                    if actual_seq != seq {
+                        return Err(VzError::BadFormat);
+                    }
+                    let stored_len = stored.len() as u64;
+                    total_stored = total_stored
+                        .checked_add(stored_len)
+                        .ok_or(VzError::ValueOverflow)?;
+                    extents.push(ChunkExtent {
+                        cluster_offset,
+                        in_cluster_offset,
+                        stored_size: stored_len,
+                        raw_size: chunk.len() as u64,
+                    });
+                }
+            } else {
+                for &chunk in &chunks {
+                    let seq = self.emitter.cluster_seq;
+                    let (cluster_offset, in_cluster_offset, actual_seq, stored_len) =
+                        if effective_codec == CODEC_NONE && self.crypto.is_none() {
+                            let (c, i, s) = self.emitter.emit_dedicated_data_cluster(
                                 entry_id,
                                 chunk.len() as u64,
-                                &enc,
+                                chunk,
                                 opts.col_stats.as_ref(),
-                            );
-                            self.encrypt_scratch = enc;
-                            r.map(|(c, i, s)| (c, i, s, slen))
+                            )?;
+                            (c, i, s, chunk.len() as u64)
                         } else {
-                            let slen = src_ref.len() as u64;
-                            self.emitter
-                                .emit_dedicated_data_cluster(
+                            let mut scratch = core::mem::take(&mut self.compress_scratch);
+                            let src_ref: &[u8] = if effective_codec == CODEC_NONE {
+                                chunk
+                            } else {
+                                let res = compress_payload_into_with_cache(
+                                    chunk,
+                                    &mut scratch,
+                                    effective_codec,
+                                    ext_codec.as_ref(),
+                                    &self.config.dicts,
+                                    Some(&self.dict_cache),
+                                    self.config.zstd_level,
+                                );
+                                if let Err(e) = res {
+                                    self.compress_scratch = scratch;
+                                    return Err(e);
+                                }
+                                &scratch
+                            };
+                            let emit_res = if let Some((_, ref ctx)) = self.crypto {
+                                let mut enc = core::mem::take(&mut self.encrypt_scratch);
+                                let er = ctx.encrypt_payload_into(
+                                    target_gen,
+                                    seq,
+                                    entry_id,
+                                    src_ref,
+                                    &mut enc,
+                                );
+                                if let Err(e) = er {
+                                    self.encrypt_scratch = enc;
+                                    self.compress_scratch = scratch;
+                                    return Err(e);
+                                }
+                                let slen = enc.len() as u64;
+                                let r = self.emitter.emit_dedicated_data_cluster(
                                     entry_id,
                                     chunk.len() as u64,
-                                    src_ref,
+                                    &enc,
                                     opts.col_stats.as_ref(),
-                                )
-                                .map(|(c, i, s)| (c, i, s, slen))
+                                );
+                                self.encrypt_scratch = enc;
+                                r.map(|(c, i, s)| (c, i, s, slen))
+                            } else {
+                                let slen = src_ref.len() as u64;
+                                self.emitter
+                                    .emit_dedicated_data_cluster(
+                                        entry_id,
+                                        chunk.len() as u64,
+                                        src_ref,
+                                        opts.col_stats.as_ref(),
+                                    )
+                                    .map(|(c, i, s)| (c, i, s, slen))
+                            };
+                            self.compress_scratch = scratch;
+                            emit_res?
                         };
-                        self.compress_scratch = scratch;
-                        emit_res?
-                    };
-                if actual_seq != seq {
-                    return Err(VzError::BadFormat);
+                    if actual_seq != seq {
+                        return Err(VzError::BadFormat);
+                    }
+                    total_stored = total_stored
+                        .checked_add(stored_len)
+                        .ok_or(VzError::ValueOverflow)?;
+                    extents.push(ChunkExtent {
+                        cluster_offset,
+                        in_cluster_offset,
+                        stored_size: stored_len,
+                        raw_size: chunk.len() as u64,
+                    });
                 }
-                total_stored = total_stored
-                    .checked_add(stored_len)
-                    .ok_or(VzError::ValueOverflow)?;
-                extents.push(ChunkExtent {
-                    cluster_offset,
-                    in_cluster_offset,
-                    stored_size: stored_len,
-                    raw_size: chunk.len() as u64,
-                });
             }
             let (table_cluster_off, table_in_cluster_off) =
                 self.emitter.emit_chunk_table_cluster(&extents)?;

@@ -3,11 +3,77 @@ use std::io::Write;
 
 use super::{LookupTarget, ResolvedEntry, VzReader, read_cluster_at};
 use crate::btree::validate_cluster;
-use crate::codec::decompress_payload_into;
+use crate::codec::{CryptoContext, ZstdDictCache, decompress_payload_into, decompress_payload_into_slice};
 use crate::error::VzError;
-use crate::ext_meta::{ChunkExtent, ExtCodecMeta, decode_chunk_table};
+use crate::ext_meta::{ChunkExtent, DictEntry, ExtCodecMeta, decode_chunk_table};
 use crate::io::RangeReader;
 use crate::wire::{ClusterFooter, ClusterHeader, DirPayload, MAGIC_CLUSTER, TAG_CHUNK_TABLE};
+
+std::thread_local! {
+    static DEC_SCRATCH_TLS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decrypt_then_decompress_into(
+    ctx: &CryptoContext,
+    generation: u64,
+    cluster_seq: u64,
+    entry_id: u64,
+    stored: &[u8],
+    out: &mut Vec<u8>,
+    raw_size: usize,
+    codec: u8,
+    ext_codec: Option<&ExtCodecMeta>,
+    dicts: &[DictEntry],
+    dict_cache: &ZstdDictCache,
+) -> Result<(), VzError> {
+    if codec == crate::wire::CODEC_NONE && ext_codec.is_none() {
+        return ctx.decrypt_payload_into(generation, cluster_seq, entry_id, stored, out);
+    }
+    let res = DEC_SCRATCH_TLS.try_with(|cell| -> Result<(), VzError> {
+        let Ok(mut scratch) = cell.try_borrow_mut() else {
+            let compressed = ctx.decrypt_payload(generation, cluster_seq, entry_id, stored)?;
+            return decompress_payload_into(
+                &compressed,
+                out,
+                raw_size,
+                codec,
+                ext_codec,
+                dicts,
+                Some(dict_cache),
+            );
+        };
+        ctx.decrypt_payload_into(generation, cluster_seq, entry_id, stored, &mut scratch)?;
+        let r = decompress_payload_into(
+            &scratch,
+            out,
+            raw_size,
+            codec,
+            ext_codec,
+            dicts,
+            Some(dict_cache),
+        );
+        if scratch.capacity() > 4 * 1024 * 1024 {
+            *scratch = Vec::new();
+        }
+        r
+    });
+    match res {
+        Ok(r) => r,
+        Err(_) => {
+            let compressed = ctx.decrypt_payload(generation, cluster_seq, entry_id, stored)?;
+            decompress_payload_into(
+                &compressed,
+                out,
+                raw_size,
+                codec,
+                ext_codec,
+                dicts,
+                Some(dict_cache),
+            )
+        }
+    }
+}
 
 impl<R: RangeReader> VzReader<R> {
     /// Reads and decodes the entire payload of `path` into memory (decompressing, decrypting,
@@ -695,6 +761,9 @@ impl<R: RangeReader> VzReader<R> {
                 let end = ioff.checked_add(slen).ok_or(VzError::ValueOverflow)?;
                 let stored_slice = cluster_slice.get(ioff..end).ok_or(VzError::BufferTooSmall)?;
 
+                if out_buf.len() < rlen {
+                    out_buf.resize(rlen, 0);
+                }
                 let codec = entry.dir_entry.codec();
                 let ext_codec = entry.ext_codec.as_ref();
                 if let Some(ref ctx) = self.crypto {
@@ -705,27 +774,25 @@ impl<R: RangeReader> VzReader<R> {
                         stored_slice,
                         &mut decrypt_buf,
                     )?;
-                    decompress_payload_into(
+                    decompress_payload_into_slice(
                         &decrypt_buf,
-                        &mut out_buf,
-                        rlen,
+                        &mut out_buf[..rlen],
                         codec,
                         ext_codec,
                         &self.dicts,
                         Some(&self.dict_cache),
                     )?;
                 } else {
-                    decompress_payload_into(
+                    decompress_payload_into_slice(
                         stored_slice,
-                        &mut out_buf,
-                        rlen,
+                        &mut out_buf[..rlen],
                         codec,
                         ext_codec,
                         &self.dicts,
                         Some(&self.dict_cache),
                     )?;
                 }
-                visitor(entry, &out_buf)?;
+                visitor(entry, &out_buf[..rlen])?;
             }
         }
 
@@ -882,18 +949,18 @@ impl<R: RangeReader> VzReader<R> {
                 let p_off = usize::try_from(payload_off).map_err(|_| VzError::ValueOverflow)?;
                 let p_end = p_off.checked_add(slen).ok_or(VzError::ValueOverflow)?;
                 let stored = all.get(p_off..p_end).ok_or(VzError::BufferTooSmall)?;
-                if codec == crate::wire::CODEC_NONE && ext_codec.is_none() {
-                    return ctx.decrypt_payload_into(generation, chdr.cluster_seq, entry_id, stored, out);
-                }
-                let compressed = ctx.decrypt_payload(generation, chdr.cluster_seq, entry_id, stored)?;
-                return decompress_payload_into(
-                    &compressed,
+                return decrypt_then_decompress_into(
+                    ctx,
+                    generation,
+                    chdr.cluster_seq,
+                    entry_id,
+                    stored,
                     out,
                     rlen,
                     codec,
                     ext_codec,
                     &self.dicts,
-                    Some(&self.dict_cache),
+                    &self.dict_cache,
                 );
             }
 
@@ -918,18 +985,18 @@ impl<R: RangeReader> VzReader<R> {
                 self.reader.read_at(payload_off, &mut stored)?;
                 (chdr, stored)
             };
-            if codec == crate::wire::CODEC_NONE && ext_codec.is_none() {
-                return ctx.decrypt_payload_into(generation, chdr.cluster_seq, entry_id, &stored, out);
-            }
-            let compressed = ctx.decrypt_payload(generation, chdr.cluster_seq, entry_id, &stored)?;
-            return decompress_payload_into(
-                &compressed,
+            return decrypt_then_decompress_into(
+                ctx,
+                generation,
+                chdr.cluster_seq,
+                entry_id,
+                &stored,
                 out,
                 rlen,
                 codec,
                 ext_codec,
                 &self.dicts,
-                Some(&self.dict_cache),
+                &self.dict_cache,
             );
         }
 

@@ -19,6 +19,10 @@ use libvz::{
 use zip::CompressionMethod;
 use zip::write::SimpleFileOptions;
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 // ============================================================================
 // INSTRUMENTED CountingReadSeek (FOR FAIR TAR / ZIP RANGE-I/O COMPARISON)
 // ============================================================================
@@ -362,6 +366,10 @@ fn write_temp_file(bytes: &[u8]) -> Result<NamedTempFile, Box<dyn std::error::Er
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== VZ vs TAR / TAR.GZ / TAR.LZ4 / TAR.ZST / ZIP Standalone Comparison ===");
     println!("crc32c_hw_active: {}", crc32c_hw_active());
+    #[cfg(feature = "mimalloc")]
+    println!("allocator: mimalloc");
+    #[cfg(not(feature = "mimalloc"))]
+    println!("allocator: system");
     let max_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);

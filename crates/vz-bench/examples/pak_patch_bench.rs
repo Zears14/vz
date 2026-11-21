@@ -37,6 +37,10 @@ use tempfile::TempDir;
 use zip::CompressionMethod;
 use zip::write::SimpleFileOptions;
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const LINUX_STABLE_URL: &str =
     "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git";
 const CANDIDATE_HOTFIX_SERIES: &[&str] = &["v7.3", "v7.1", "v7.0", "v6.19", "v6.12"];

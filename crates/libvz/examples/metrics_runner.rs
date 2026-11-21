@@ -3,7 +3,7 @@ use std::fs::File;
 use std::hint::black_box;
 use std::io::{Cursor, Read, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use libvz::ext_meta::DictEntry;
@@ -18,9 +18,10 @@ use libvz::{
 
 struct TrackingAllocator;
 
+static TRACKING_ENABLED: AtomicBool = AtomicBool::new(false);
 static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
-static CURRENT_BYTES: AtomicUsize = AtomicUsize::new(0);
-static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+static CURRENT_DELTA: AtomicIsize = AtomicIsize::new(0);
+static PEAK_DELTA: AtomicUsize = AtomicUsize::new(0);
 
 #[global_allocator]
 static GLOBAL: TrackingAllocator = TrackingAllocator;
@@ -28,25 +29,39 @@ static GLOBAL: TrackingAllocator = TrackingAllocator;
 unsafe impl GlobalAlloc for TrackingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() {
+        if !ptr.is_null() && TRACKING_ENABLED.load(Ordering::Relaxed) {
             ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
-            let cur = CURRENT_BYTES.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-            PEAK_BYTES.fetch_max(cur, Ordering::Relaxed);
+            let sz = layout.size() as isize;
+            let cur = CURRENT_DELTA.fetch_add(sz, Ordering::Relaxed) + sz;
+            if cur > 0 {
+                PEAK_DELTA.fetch_max(cur as usize, Ordering::Relaxed);
+            }
         }
         ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        CURRENT_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+        if TRACKING_ENABLED.load(Ordering::Relaxed) {
+            CURRENT_DELTA.fetch_sub(layout.size() as isize, Ordering::Relaxed);
+        }
         unsafe { System.dealloc(ptr, layout) };
     }
 }
 
-fn reset_alloc_tracker() -> (u64, usize) {
-    let cur = CURRENT_BYTES.load(Ordering::Relaxed);
-    PEAK_BYTES.store(cur, Ordering::Relaxed);
-    let cnt = ALLOC_COUNT.load(Ordering::Relaxed);
-    (cnt, cur)
+fn start_alloc_tracker() -> u64 {
+    TRACKING_ENABLED.store(false, Ordering::SeqCst);
+    CURRENT_DELTA.store(0, Ordering::SeqCst);
+    PEAK_DELTA.store(0, Ordering::SeqCst);
+    let cnt = ALLOC_COUNT.load(Ordering::SeqCst);
+    TRACKING_ENABLED.store(true, Ordering::SeqCst);
+    cnt
+}
+
+fn stop_alloc_tracker(cnt0: u64) -> (u64, usize) {
+    TRACKING_ENABLED.store(false, Ordering::SeqCst);
+    let cnt1 = ALLOC_COUNT.load(Ordering::SeqCst);
+    let peak = PEAK_DELTA.load(Ordering::SeqCst);
+    (cnt1 - cnt0, peak)
 }
 
 fn read_vm_hwm_kib() -> Option<u64> {
@@ -243,18 +258,19 @@ fn main() {
                 Some((man.parity_index, pay.to_vec()))
             })
             .collect();
-        let t0 = Instant::now();
+        let mut dslots: Vec<Option<Vec<u8>>> = clusters.iter().map(|c| Some(c.clone())).collect();
+        let mut dt_rs_dec = 0.0f64;
         for _ in 0..reps {
-            let mut dslots: Vec<Option<Vec<u8>>> = clusters.iter().map(|c| Some(c.clone())).collect();
             for s in dslots.iter_mut().take(m as usize) {
                 *s = None;
             }
+            let t_step = Instant::now();
             black_box(
                 recover_rs_gf256_stripe(&mut dslots, &parity_slots, k as usize, m as usize, max_len)
                     .unwrap(),
             );
+            dt_rs_dec += t_step.elapsed().as_secs_f64();
         }
-        let dt_rs_dec = t0.elapsed().as_secs_f64();
         println!(
             "RS_GF256 K={k},M={m} encode: {:.2} MB/s (data), recover ({m} erasures): {:.2} MB/s (data)",
             (k as f64 * reps as f64) / dt_rs_enc,
@@ -314,7 +330,7 @@ fn main() {
 
         let t0 = Instant::now();
         let r = VzReader::open_with_options(
-            arc.clone(),
+            arc.as_slice(),
             VzReaderOptions {
                 encryption: enc,
                 repair_boot_ecc: true,
@@ -359,7 +375,7 @@ fn main() {
 
         let t0 = Instant::now();
         let r = VzReader::open_with_options(
-            arc.clone(),
+            arc.as_slice(),
             VzReaderOptions {
                 encryption: enc,
                 repair_boot_ecc: true,
@@ -619,7 +635,7 @@ fn main() {
     // 6. Memory Footprint (64 MiB streaming pipe write & multi-cluster read)
     println!("\n[6] Streaming Memory Footprint (64 MiB payload, 1 MiB cluster)");
     let tmp_stream = tempfile::NamedTempFile::new().unwrap();
-    let (cnt0, base0) = reset_alloc_tracker();
+    let cnt0 = start_alloc_tracker();
     {
         let mut pw = VzPipeWriter::new(
             tmp_stream.reopen().unwrap(),
@@ -641,28 +657,23 @@ fn main() {
         .unwrap();
         let _ = pw.finish().unwrap();
     }
-    let cnt1 = ALLOC_COUNT.load(Ordering::Relaxed);
-    let peak1 = PEAK_BYTES.load(Ordering::Relaxed);
+    let (allocs1, peak1) = stop_alloc_tracker(cnt0);
     println!(
-        "64 MiB streaming pipe write: allocs={}, peak_heap_delta={:.2} MiB (baseline={:.2} MiB)",
-        cnt1 - cnt0,
-        peak1.saturating_sub(base0) as f64 / (1024.0 * 1024.0),
-        base0 as f64 / (1024.0 * 1024.0)
+        "64 MiB streaming pipe write: allocs={allocs1}, peak_heap_delta={:.2} MiB",
+        peak1 as f64 / (1024.0 * 1024.0),
     );
 
-    let (cnt2, base2) = reset_alloc_tracker();
+    let cnt2 = start_alloc_tracker();
     {
         let r = VzReader::open(tmp_stream.reopen().unwrap()).unwrap();
         let mut sink = NullSink(0);
         r.read_file_to_writer("/stream64m.bin", &mut sink).unwrap();
         assert_eq!(sink.0, 64 * 1024 * 1024);
     }
-    let cnt3 = ALLOC_COUNT.load(Ordering::Relaxed);
-    let peak3 = PEAK_BYTES.load(Ordering::Relaxed);
+    let (allocs3, peak3) = stop_alloc_tracker(cnt2);
     println!(
-        "64 MiB multi-cluster stream read: allocs={}, peak_heap_delta={:.2} MiB, VmHWM={:?} KiB",
-        cnt3 - cnt2,
-        peak3.saturating_sub(base2) as f64 / (1024.0 * 1024.0),
+        "64 MiB multi-cluster stream read: allocs={allocs3}, peak_heap_delta={:.2} MiB, VmHWM={:?} KiB",
+        peak3 as f64 / (1024.0 * 1024.0),
         read_vm_hwm_kib()
     );
 

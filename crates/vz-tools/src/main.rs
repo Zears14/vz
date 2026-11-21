@@ -6,6 +6,10 @@ use std::time::UNIX_EPOCH;
 
 use clap::{Parser, Subcommand};
 use libvz::cli_support::{CliCodec, CliHashAlgo};
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use libvz::{
     CompactOptions, EncryptionKey, EntryOptions, InPlaceCompactOptions, KIND_DIR, KIND_LNK,
     KIND_REG, LsmAppendWriter, MmapRangeReader, OwnerEntry, VzError, VzPipeWriter, VzReader,

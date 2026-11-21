@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "pak_patch_bench"
 path = "examples/pak_patch_bench.rs"
 
+[features]
+default = []
+mimalloc = ["dep:mimalloc"]
+
 [dependencies]
 libvz = { path = "../libvz", features = ["std", "compression", "hashes", "crypto", "mmap"] }
 tar = "0.4"
@@ -22,3 +26,4 @@ zstd = "0.13"
 zip = { version = "2.4", default-features = false, features = ["deflate", "zstd"] }
 tempfile = "3.27"
 repak = { git = "https://github.com/trumank/repak", rev = "355b5f62f51959c7cc6dd5a51708646ef483065d", default-features = false, features = ["compression"] }
+mimalloc = { version = "0.1", optional = true }

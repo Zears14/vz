@@ -5,9 +5,11 @@ use std::io::{Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 
-use super::btree_build::{align_up_64, build_btree_index, build_registry_bytes, mark_hash_collisions};
+use super::btree_build::{
+    align_up_64, build_btree_index, build_registry_bytes, sort_and_mark_hash_collisions,
+};
 use super::emitter::{ClusterEmitter, StagedEntry};
-use crate::btree::{key128_cmp, validate_cluster};
+use crate::btree::validate_cluster;
 use crate::codec::{CryptoContext, EncryptionKey};
 use crate::crc::crc32c;
 use crate::ecc::{boot_ecc_encode, boot_ecc_verify_and_repair};
@@ -2068,12 +2070,7 @@ fn finish_btree_and_boot_block(
         });
     }
 
-    mark_hash_collisions(&mut staged);
-    staged.sort_by(|a, b| {
-        key128_cmp(a.parent_hash, a.name_hash, b.parent_hash, b.name_hash)
-            .then_with(|| a.parent_path.cmp(&b.parent_path))
-            .then_with(|| a.basename.cmp(&b.basename))
-    });
+    sort_and_mark_hash_collisions(&mut staged);
 
     let total_entries = staged.len() as u64;
     let registry_bytes = build_registry_bytes(

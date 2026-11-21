@@ -3,11 +3,11 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::btree_build::{
     BootCommitSpec, align_up_64, build_btree_index, build_registry_bytes, commit_boot_block,
-    mark_hash_collisions, serialize_dir_node_tlv,
+    serialize_dir_node_tlv, sort_and_mark_hash_collisions,
 };
 use super::emitter::{ClusterEmitter, StagedEntry};
 use super::EntryOptions;
-use crate::btree::{LeafNodeView, key128_cmp};
+use crate::btree::LeafNodeView;
 use crate::codec::{CryptoContext, EncryptionKey, compress_payload};
 use crate::error::VzError;
 use crate::ext_meta::{
@@ -392,11 +392,7 @@ impl<F: Read + Write + Seek + RangeReader> LsmAppendWriter<F> {
         } else {
             let compressed = compress_payload(data, effective_codec, ext_codec.as_ref(), &self.dicts, 3)?;
             let est_add = 16 + DataManifestHeader::SIZE + 64 + compressed.len() + 40;
-            if !self.emitter.pending_body.is_empty()
-                && self.emitter.pending_body.len() + est_add > self.emitter.target_cluster_size
-            {
-                self.emitter.flush_pending_data_cluster()?;
-            }
+            self.emitter.ensure_pending_capacity(est_add)?;
             let seq = self.emitter.cluster_seq;
             let stored = match &self.crypto {
                 Some(ctx) => ctx.encrypt_payload(self.new_generation, seq, entry_id, &compressed)?,
@@ -519,12 +515,7 @@ impl<F: Read + Write + Seek + RangeReader> LsmAppendWriter<F> {
         }
         drop(base_reader);
 
-        mark_hash_collisions(&mut self.entries);
-        self.entries.sort_by(|a, b| {
-            key128_cmp(a.parent_hash, a.name_hash, b.parent_hash, b.name_hash)
-                .then_with(|| a.parent_path.cmp(&b.parent_path))
-                .then_with(|| a.basename.cmp(&b.basename))
-        });
+        sort_and_mark_hash_collisions(&mut self.entries);
 
         let boot_size = self.active_slot.boot_block_size as usize;
         let ecc_active =

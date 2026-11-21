@@ -3,11 +3,10 @@ use std::io::{Seek, SeekFrom, Write};
 
 use super::btree_build::{
     BootCommitSpec, align_up_64, build_btree_index, build_registry_bytes, commit_boot_block,
-    mark_hash_collisions,
+    sort_and_mark_hash_collisions,
 };
 use super::emitter::{ClusterEmitter, StagedEntry};
 use super::{EntryOptions, VzWriter, VzWriterConfig};
-use crate::btree::key128_cmp;
 use crate::codec::{CryptoContext, EncryptionKey};
 use crate::error::VzError;
 use crate::ext_meta::{ChunkExtent, CipherHeader, DataManifestHeader, SchemaLinkMeta};
@@ -342,11 +341,7 @@ pub fn compact_archive_with_options<R: RangeReader, W: Write + Seek>(
                         };
                         let est_add =
                             16 + DataManifestHeader::SIZE + 64 + plain_slice.len() + if out_crypto.is_some() { 80 } else { 40 };
-                        if !emitter.pending_body.is_empty()
-                            && emitter.pending_body.len() + est_add > emitter.target_cluster_size
-                        {
-                            emitter.flush_pending_data_cluster()?;
-                        }
+                        emitter.ensure_pending_capacity(est_add)?;
                         let seq = emitter.cluster_seq;
                         let out_slice: &[u8] = match &out_crypto {
                             Some((_, ctx)) => {
@@ -417,12 +412,7 @@ pub fn compact_archive_with_options<R: RangeReader, W: Write + Seek>(
     }
 
     emitter.flush_pending_data_cluster()?;
-    mark_hash_collisions(&mut staged);
-    staged.sort_by(|a, b| {
-        key128_cmp(a.parent_hash, a.name_hash, b.parent_hash, b.name_hash)
-            .then_with(|| a.parent_path.cmp(&b.parent_path))
-            .then_with(|| a.basename.cmp(&b.basename))
-    });
+    sort_and_mark_hash_collisions(&mut staged);
 
     let total_entries = staged.len() as u64;
     let registry_bytes = build_registry_bytes(

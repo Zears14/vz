@@ -1,13 +1,16 @@
 use std::io::Write;
 
-use crate::crc::crc32c;
+use crate::crc::{crc32c, crc32c_combine, crc32c_update};
 use crate::error::VzError;
 use crate::ext_meta::{
     ChunkExtent, ColChunkStats, DataManifestHeader, ExtCodecMeta, OwnerEntry, RawTlv,
     SchemaLinkMeta, SparseExtent, Xattr, encode_chunk_table, push_levint, push_lp_bytes, push_tlv,
 };
 use crate::rs::{build_cluster_from_body, encode_rs_gf256_stripe};
-use crate::wire::{ClusterHeader, DirPayload, ExtTime, TAG_CHUNK_TABLE, TAG_DATA_MANIFEST, levint_len};
+use crate::wire::{
+    ClusterFooter, ClusterHeader, DirPayload, ExtTime, MAGIC_CLUSTER, MAGIC_FOOTER,
+    TAG_CHUNK_TABLE, TAG_DATA_MANIFEST, levint_len, write_void_align64,
+};
 
 #[derive(Debug, Clone)]
 pub(super) struct StagedEntry {
@@ -36,7 +39,10 @@ pub(super) struct ClusterEmitter<W: Write> {
     pub(super) cluster_seq: u64,
     pub(super) prev_cluster_len: u64,
     pub(super) rs_parity: Option<(u16, u16)>,
-    pub(super) pending_body: Vec<u8>,
+    /// Cluster assembly buffer keeping `ClusterHeader::SIZE` leading headroom bytes when non-empty.
+    pending_buf: Vec<u8>,
+    /// Incremental finalized CRC32C of `pending_buf[ClusterHeader::SIZE..]`.
+    pending_body_crc: u32,
     pub(super) target_cluster_size: usize,
     pub(super) stripe_clusters: Vec<Vec<u8>>,
     pub(super) stripe_offsets: Vec<u64>,
@@ -44,7 +50,7 @@ pub(super) struct ClusterEmitter<W: Write> {
 }
 
 impl<W: Write> ClusterEmitter<W> {
-    pub(super)fn new(
+    pub(super) fn new(
         writer: W,
         start_offset: u64,
         start_seq: u64,
@@ -63,7 +69,8 @@ impl<W: Write> ClusterEmitter<W> {
             cluster_seq: start_seq,
             prev_cluster_len,
             rs_parity,
-            pending_body: Vec::new(),
+            pending_buf: Vec::new(),
+            pending_body_crc: 0,
             target_cluster_size: target_cluster_size.max(4096),
             stripe_clusters: Vec::new(),
             stripe_offsets: Vec::new(),
@@ -71,7 +78,21 @@ impl<W: Write> ClusterEmitter<W> {
         })
     }
 
-    pub(super)fn emit_raw_cluster_bytes(&mut self, cluster: Vec<u8>) -> Result<(u64, u32), VzError> {
+    #[inline]
+    pub(super) fn pending_body_len(&self) -> usize {
+        self.pending_buf.len().saturating_sub(ClusterHeader::SIZE)
+    }
+
+    #[inline]
+    pub(super) fn ensure_pending_capacity(&mut self, est_add: usize) -> Result<(), VzError> {
+        let body_len = self.pending_body_len();
+        if body_len > 0 && body_len + est_add > self.target_cluster_size {
+            self.flush_pending_data_cluster()?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn emit_raw_cluster_bytes(&mut self, cluster: Vec<u8>) -> Result<(u64, u32), VzError> {
         let off = self.current_offset;
         let len = u32::try_from(cluster.len()).map_err(|_| VzError::ValueOverflow)?;
         self.writer.write_all(&cluster).map_err(|_| VzError::IoError)?;
@@ -95,7 +116,7 @@ impl<W: Write> ClusterEmitter<W> {
         Ok((off, len))
     }
 
-    pub(super)fn emit_cluster_body(&mut self, body_tlv: &[u8]) -> Result<(u64, u32), VzError> {
+    pub(super) fn emit_cluster_body(&mut self, body_tlv: &[u8]) -> Result<(u64, u32), VzError> {
         let cluster = build_cluster_from_body(body_tlv, self.prev_cluster_len, self.cluster_seq)?;
         self.emit_raw_cluster_bytes(cluster)
     }
@@ -142,27 +163,92 @@ impl<W: Write> ClusterEmitter<W> {
     }
 
     pub(super) fn flush_pending_data_cluster(&mut self) -> Result<(), VzError> {
-        if self.pending_body.is_empty() {
+        let body_len = self.pending_body_len();
+        if body_len == 0 {
             return Ok(());
         }
-        let body = core::mem::take(&mut self.pending_body);
-        self.emit_cluster_body(&body)?;
+        let min_unaligned = ClusterHeader::SIZE
+            .checked_add(body_len)
+            .and_then(|v| v.checked_add(ClusterFooter::SIZE))
+            .ok_or(VzError::ValueOverflow)?;
+        let rem = min_unaligned & 63;
+        let pad = if rem == 0 { 0 } else { 64 - rem };
+        let total_len = min_unaligned
+            .checked_add(pad)
+            .ok_or(VzError::ValueOverflow)?;
+        let body_end = ClusterHeader::SIZE + body_len;
+
+        let hdr = ClusterHeader {
+            sync_magic: MAGIC_CLUSTER,
+            cluster_len: total_len as u64,
+            prev_cluster_len: self.prev_cluster_len,
+            cluster_seq: self.cluster_seq,
+        };
+        hdr.write_bytes(&mut self.pending_buf[..ClusterHeader::SIZE])?;
+
+        if pad > 0 {
+            let mut pad_buf = [0u8; 64];
+            let written = write_void_align64(
+                &mut pad_buf[..pad],
+                (body_end + ClusterFooter::SIZE) as u64,
+            )?;
+            if written != pad {
+                return Err(VzError::BadFormat);
+            }
+            self.pending_buf.extend_from_slice(&pad_buf[..pad]);
+        }
+
+        let ftr_start = self.pending_buf.len();
+        self.pending_buf
+            .resize(ftr_start + ClusterFooter::SIZE, 0);
+        let mut ftr = ClusterFooter {
+            cluster_len: total_len as u64,
+            cluster_crc32c: 0,
+            footer_magic: MAGIC_FOOTER,
+        };
+        ftr.write_bytes(&mut self.pending_buf[ftr_start..])?;
+
+        // Single-pass cluster CRC32C via GF(2) combine (avoids re-hashing payload bytes).
+        let hdr_crc = crc32c(&self.pending_buf[..ClusterHeader::SIZE]);
+        let with_body = crc32c_combine(hdr_crc, self.pending_body_crc, body_len);
+        let tail = &self.pending_buf[body_end..total_len - 8];
+        ftr.cluster_crc32c = !crc32c_update(!with_body, tail);
+        ftr.write_bytes(&mut self.pending_buf[ftr_start..])?;
+
+        if self.rs_parity.is_some() {
+            let full = core::mem::take(&mut self.pending_buf);
+            self.pending_body_crc = 0;
+            self.emit_raw_cluster_bytes(full)?;
+        } else {
+            let len_u64 = u64::try_from(total_len).map_err(|_| VzError::ValueOverflow)?;
+            self.writer
+                .write_all(&self.pending_buf[..total_len])
+                .map_err(|_| VzError::IoError)?;
+            self.current_offset = self
+                .current_offset
+                .checked_add(len_u64)
+                .ok_or(VzError::ValueOverflow)?;
+            self.prev_cluster_len = len_u64;
+            self.cluster_seq += 1;
+            self.pending_buf.truncate(ClusterHeader::SIZE);
+            self.pending_body_crc = 0;
+        }
         Ok(())
     }
 
-    /// Appends a 64-byte-aligned `TAG_DATA_MANIFEST` TLV to `body`, returning `in_cluster_offset`.
-    pub(super) fn append_manifest_tlv_to_body(
-        body: &mut Vec<u8>,
+    fn append_manifest_prefix_into(
+        buf: &mut Vec<u8>,
+        body_start: usize,
         cluster_off: u64,
         entry_id: u64,
         raw_size: u64,
-        stored_payload: &[u8],
+        stored_len: usize,
+        payload_crc32c: u32,
         stats_bytes: &[u8],
         manifest_flags: u16,
     ) -> Result<u32, VzError> {
-        let body_pos = body.len();
+        let body_pos = buf.len() - body_start;
         let prefix_len = DataManifestHeader::SIZE + stats_bytes.len();
-        let stored_len = stored_payload.len();
         let file_pos_before_tlv = cluster_off + ClusterHeader::SIZE as u64 + body_pos as u64;
 
         let (vint_w, pad) = solve_manifest_align64(file_pos_before_tlv, prefix_len, stored_len)?;
@@ -180,16 +266,41 @@ impl<W: Write> ClusterEmitter<W> {
             entry_id,
             raw_size,
             stored_size: stored_len as u64,
-            payload_crc32c: crc32c(stored_payload),
+            payload_crc32c,
             manifest_flags,
             payload_rel_off,
         };
-        body.reserve(1 + vint_w + val_len);
-        push_levint(body, TAG_DATA_MANIFEST)?;
-        push_levint(body, val_len as u64)?;
-        body.extend_from_slice(&hdr.to_bytes());
-        body.extend_from_slice(stats_bytes);
-        write_padding_bytes(body, pad)?;
+        buf.reserve(1 + vint_w + prefix_len + pad);
+        push_levint(buf, TAG_DATA_MANIFEST)?;
+        push_levint(buf, val_len as u64)?;
+        buf.extend_from_slice(&hdr.to_bytes());
+        buf.extend_from_slice(stats_bytes);
+        write_padding_bytes(buf, pad)?;
+        Ok(in_cluster_offset)
+    }
+
+    /// Appends a 64-byte-aligned `TAG_DATA_MANIFEST` TLV to `body`, returning `in_cluster_offset`.
+    pub(super) fn append_manifest_tlv_to_body(
+        body: &mut Vec<u8>,
+        cluster_off: u64,
+        entry_id: u64,
+        raw_size: u64,
+        stored_payload: &[u8],
+        stats_bytes: &[u8],
+        manifest_flags: u16,
+    ) -> Result<u32, VzError> {
+        let payload_crc = crc32c(stored_payload);
+        let in_cluster_offset = Self::append_manifest_prefix_into(
+            body,
+            0,
+            cluster_off,
+            entry_id,
+            raw_size,
+            stored_payload.len(),
+            payload_crc,
+            stats_bytes,
+            manifest_flags,
+        )?;
         body.extend_from_slice(stored_payload);
         Ok(in_cluster_offset)
     }
@@ -207,23 +318,35 @@ impl<W: Write> ClusterEmitter<W> {
         let manifest_flags: u16 = 0x0002 | u16::from(col_stats.is_some());
         let prefix_len = DataManifestHeader::SIZE + stats_bytes.len();
         let est_add = 16 + prefix_len + 64 + stored_payload.len();
-        if !self.pending_body.is_empty() && self.pending_body.len() + est_add > self.target_cluster_size {
-            self.flush_pending_data_cluster()?;
+        self.ensure_pending_capacity(est_add)?;
+
+        if self.pending_buf.is_empty() {
+            self.pending_buf.resize(ClusterHeader::SIZE, 0);
+            self.pending_body_crc = 0;
         }
 
         let cluster_off = self.current_offset;
         let seq = self.cluster_seq;
-        let in_cluster_offset = Self::append_manifest_tlv_to_body(
-            &mut self.pending_body,
+        let payload_crc = crc32c(stored_payload);
+        let prev_len = self.pending_buf.len();
+        let in_cluster_offset = Self::append_manifest_prefix_into(
+            &mut self.pending_buf,
+            ClusterHeader::SIZE,
             cluster_off,
             entry_id,
             raw_size,
-            stored_payload,
+            stored_payload.len(),
+            payload_crc,
             &stats_bytes,
             manifest_flags,
         )?;
+        let hdr_part = &self.pending_buf[prev_len..];
+        let crc_with_hdr = !crc32c_update(!self.pending_body_crc, hdr_part);
+        self.pending_body_crc =
+            crc32c_combine(crc_with_hdr, payload_crc, stored_payload.len());
+        self.pending_buf.extend_from_slice(stored_payload);
 
-        if self.pending_body.len() >= self.target_cluster_size {
+        if self.pending_body_len() >= self.target_cluster_size {
             self.flush_pending_data_cluster()?;
         }
         Ok((cluster_off, in_cluster_offset, seq))
@@ -242,17 +365,90 @@ impl<W: Write> ClusterEmitter<W> {
         let manifest_flags: u16 = 0x0002 | u16::from(col_stats.is_some());
         let cluster_off = self.current_offset;
         let seq = self.cluster_seq;
-        let mut body = Vec::new();
-        let in_cluster_offset = Self::append_manifest_tlv_to_body(
-            &mut body,
+        let payload_crc = crc32c(stored_payload);
+
+        let mut head = Vec::with_capacity(ClusterHeader::SIZE + 128 + stats_bytes.len());
+        head.resize(ClusterHeader::SIZE, 0);
+        let in_cluster_offset = Self::append_manifest_prefix_into(
+            &mut head,
+            ClusterHeader::SIZE,
             cluster_off,
             entry_id,
             raw_size,
-            stored_payload,
+            stored_payload.len(),
+            payload_crc,
             &stats_bytes,
             manifest_flags,
         )?;
-        self.emit_cluster_body(&body)?;
+
+        let min_unaligned = head
+            .len()
+            .checked_add(stored_payload.len())
+            .and_then(|v| v.checked_add(ClusterFooter::SIZE))
+            .ok_or(VzError::ValueOverflow)?;
+        let rem = min_unaligned & 63;
+        let pad = if rem == 0 { 0 } else { 64 - rem };
+        let total_len = min_unaligned
+            .checked_add(pad)
+            .ok_or(VzError::ValueOverflow)?;
+        let body_end_in_cluster = head.len() + stored_payload.len();
+
+        let chdr = ClusterHeader {
+            sync_magic: MAGIC_CLUSTER,
+            cluster_len: total_len as u64,
+            prev_cluster_len: self.prev_cluster_len,
+            cluster_seq: seq,
+        };
+        chdr.write_bytes(&mut head[..ClusterHeader::SIZE])?;
+
+        let mut tail = [0u8; 64 + ClusterFooter::SIZE];
+        if pad > 0 {
+            let written = write_void_align64(
+                &mut tail[..pad],
+                (body_end_in_cluster + ClusterFooter::SIZE) as u64,
+            )?;
+            if written != pad {
+                return Err(VzError::BadFormat);
+            }
+        }
+        let mut ftr = ClusterFooter {
+            cluster_len: total_len as u64,
+            cluster_crc32c: 0,
+            footer_magic: MAGIC_FOOTER,
+        };
+        ftr.write_bytes(&mut tail[pad..pad + ClusterFooter::SIZE])?;
+
+        let head_crc = crc32c(&head);
+        let with_payload = crc32c_combine(head_crc, payload_crc, stored_payload.len());
+        ftr.cluster_crc32c = !crc32c_update(!with_payload, &tail[..pad + 8]);
+        ftr.write_bytes(&mut tail[pad..pad + ClusterFooter::SIZE])?;
+
+        if self.rs_parity.is_some() {
+            let mut full = Vec::with_capacity(total_len);
+            full.extend_from_slice(&head);
+            full.extend_from_slice(stored_payload);
+            full.extend_from_slice(&tail[..pad + ClusterFooter::SIZE]);
+            self.emit_raw_cluster_bytes(full)?;
+        } else {
+            let len_u64 = u64::try_from(total_len).map_err(|_| VzError::ValueOverflow)?;
+            self.writer
+                .write_all(&head)
+                .map_err(|_| VzError::IoError)?;
+            if !stored_payload.is_empty() {
+                self.writer
+                    .write_all(stored_payload)
+                    .map_err(|_| VzError::IoError)?;
+            }
+            self.writer
+                .write_all(&tail[..pad + ClusterFooter::SIZE])
+                .map_err(|_| VzError::IoError)?;
+            self.current_offset = self
+                .current_offset
+                .checked_add(len_u64)
+                .ok_or(VzError::ValueOverflow)?;
+            self.prev_cluster_len = len_u64;
+            self.cluster_seq += 1;
+        }
         Ok((cluster_off, in_cluster_offset, seq))
     }
 

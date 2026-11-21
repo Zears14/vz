@@ -2,11 +2,10 @@ use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::btree_build::{
-    align_up_64, build_btree_index, build_registry_bytes, mark_hash_collisions,
+    align_up_64, build_btree_index, build_registry_bytes, sort_and_mark_hash_collisions,
 };
 use super::emitter::{ClusterEmitter, StagedEntry};
 use super::{EntryOptions, VzWriterConfig};
-use crate::btree::key128_cmp;
 use crate::codec::{CryptoContext, ZstdDictCache, compress_payload_with_cache};
 use crate::crc::crc32c;
 use crate::ecc::boot_ecc_encode;
@@ -279,11 +278,7 @@ impl<W: Write> VzPipeWriter<W> {
                 self.config.zstd_level,
             )?;
             let est_add = 16 + DataManifestHeader::SIZE + 64 + compressed.len() + 40;
-            if !self.emitter.pending_body.is_empty()
-                && self.emitter.pending_body.len() + est_add > self.emitter.target_cluster_size
-            {
-                self.emitter.flush_pending_data_cluster()?;
-            }
+            self.emitter.ensure_pending_capacity(est_add)?;
             let seq = self.emitter.cluster_seq;
             let stored = match &self.crypto {
                 Some((_, ctx)) => {
@@ -452,12 +447,7 @@ impl<W: Write> VzPipeWriter<W> {
     /// `TAG_ROOT_FALLBACK` cluster at EOF.
     pub fn finish(mut self) -> Result<(W, PipeFinalizeInfo), VzError> {
         self.emitter.flush_pending_data_cluster()?;
-        mark_hash_collisions(&mut self.entries);
-        self.entries.sort_by(|a, b| {
-            key128_cmp(a.parent_hash, a.name_hash, b.parent_hash, b.name_hash)
-                .then_with(|| a.parent_path.cmp(&b.parent_path))
-                .then_with(|| a.basename.cmp(&b.basename))
-        });
+        sort_and_mark_hash_collisions(&mut self.entries);
 
         let total_entries = self.entries.len() as u64;
         let boot_size = self.config.boot_block_size as usize;

@@ -1,12 +1,13 @@
-use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
 use super::emitter::{ClusterEmitter, StagedEntry};
+use crate::btree::key128_cmp;
 use crate::crc::crc32c;
 use crate::ecc::boot_ecc_encode;
 use crate::error::VzError;
 use crate::ext_meta::{
-    DictEntry, LsmRunDesc, OwnerEntry, RawTlv, SchemaEntry, encode_dict_table, encode_ext_codec, encode_ext_owner, encode_lsm_runs, encode_owner_table, encode_schema_link,
+    DictEntry, LsmRunDesc, OwnerEntry, RawTlv, SchemaEntry, encode_dict_table, encode_ext_codec,
+    encode_ext_owner, encode_lsm_runs, encode_owner_table, encode_schema_link,
     encode_schema_table, encode_sparse_extents, encode_xattr_list, push_lp_bytes, push_tlv,
 };
 use crate::wire::{
@@ -31,26 +32,47 @@ pub(super) fn align_up_64(v: usize) -> usize {
     (v + 63) & !63
 }
 
-pub(super) fn mark_hash_collisions(entries: &mut [StagedEntry]) {
-    let mut parent_paths_by_hash: HashMap<u64, HashSet<String>> = HashMap::new();
-    let mut key128_counts: HashMap<(u64, u64), usize> = HashMap::new();
-    for e in entries.iter() {
-        parent_paths_by_hash
-            .entry(e.parent_hash)
-            .or_default()
-            .insert(e.parent_path.clone());
-        *key128_counts.entry((e.parent_hash, e.name_hash)).or_insert(0) += 1;
-    }
-    for e in entries.iter_mut() {
-        let p_coll = parent_paths_by_hash
-            .get(&e.parent_hash)
-            .is_some_and(|s| s.len() > 1);
-        let k_coll = key128_counts
-            .get(&(e.parent_hash, e.name_hash))
-            .is_some_and(|&c| c > 1);
-        if p_coll || k_coll {
-            e.flags_and_codec |= FLAG_HASH_COLLISION;
+/// Canonicalizes entry ordering by 128-bit `(parent_hash, name_hash, parent_path, basename)` and
+/// flags any hash-colliding runs with `FLAG_HASH_COLLISION` in a single allocation-free pass.
+pub(super) fn sort_and_mark_hash_collisions(entries: &mut [StagedEntry]) {
+    entries.sort_by(|a, b| {
+        key128_cmp(a.parent_hash, a.name_hash, b.parent_hash, b.name_hash)
+            .then_with(|| a.parent_path.cmp(&b.parent_path))
+            .then_with(|| a.basename.cmp(&b.basename))
+    });
+    let n = entries.len();
+    let mut i = 0usize;
+    while i < n {
+        let p_hash = entries[i].parent_hash;
+        let mut j = i + 1;
+        let mut p_coll = false;
+        while j < n && entries[j].parent_hash == p_hash {
+            if entries[j].parent_path != entries[i].parent_path {
+                p_coll = true;
+            }
+            j += 1;
         }
+        if p_coll {
+            for e in &mut entries[i..j] {
+                e.flags_and_codec |= FLAG_HASH_COLLISION;
+            }
+        } else {
+            let mut a = i;
+            while a < j {
+                let n_hash = entries[a].name_hash;
+                let mut b = a + 1;
+                while b < j && entries[b].name_hash == n_hash {
+                    b += 1;
+                }
+                if b - a > 1 {
+                    for e in &mut entries[a..b] {
+                        e.flags_and_codec |= FLAG_HASH_COLLISION;
+                    }
+                }
+                a = b;
+            }
+        }
+        i = j;
     }
 }
 
@@ -88,69 +110,106 @@ pub(super) fn build_registry_bytes(
     Ok(reg)
 }
 
-fn build_entry_ext_chain(e: &StagedEntry) -> Result<Vec<u8>, VzError> {
-    let mut chain = Vec::new();
+fn append_entry_ext_chain(e: &StagedEntry, chain: &mut Vec<u8>) -> Result<(), VzError> {
+    let start = chain.len();
     if (e.flags_and_codec & FLAG_HASH_COLLISION) != 0 {
-        push_tlv(&mut chain, TAG_PARENT_PATH, e.parent_path.as_bytes())?;
+        push_tlv(chain, TAG_PARENT_PATH, e.parent_path.as_bytes())?;
     }
     if (e.flags_and_codec & FLAG_INODE_64) != 0 {
         let hi = (e.entry_id >> 32) as u32;
-        push_tlv(&mut chain, TAG_INODE_HI, &hi.to_le_bytes())?;
+        push_tlv(chain, TAG_INODE_HI, &hi.to_le_bytes())?;
     }
     if let Some(ref time) = e.ext_time {
-        push_tlv(&mut chain, TAG_EXT_TIME, &time.to_bytes())?;
+        push_tlv(chain, TAG_EXT_TIME, &time.to_bytes())?;
     }
     if let Some(ref owner) = e.ext_owner {
         let val = encode_ext_owner(owner)?;
-        push_tlv(&mut chain, TAG_EXT_OWNER, &val)?;
+        push_tlv(chain, TAG_EXT_OWNER, &val)?;
     }
     if !e.xattrs.is_empty() {
         let val = encode_xattr_list(&e.xattrs)?;
-        push_tlv(&mut chain, TAG_XATTR_LIST, &val)?;
+        push_tlv(chain, TAG_XATTR_LIST, &val)?;
     }
     if let Some(ref ext_codec) = e.ext_codec {
         let val = encode_ext_codec(ext_codec)?;
-        push_tlv(&mut chain, TAG_EXT_CODEC, &val)?;
+        push_tlv(chain, TAG_EXT_CODEC, &val)?;
     }
     if let Some(ref link) = e.schema_link {
         let val = encode_schema_link(link)?;
-        push_tlv(&mut chain, TAG_SCHEMA_LINK, &val)?;
+        push_tlv(chain, TAG_SCHEMA_LINK, &val)?;
     }
     if let Some(ref extents) = e.sparse_extents {
         let val = encode_sparse_extents(extents)?;
-        push_tlv(&mut chain, TAG_SPARSE_EXTENTS, &val)?;
+        push_tlv(chain, TAG_SPARSE_EXTENTS, &val)?;
     }
     for raw in &e.extra_ext_tlvs {
         if raw.tag != TAG_NOP {
-            push_tlv(&mut chain, raw.tag, &raw.value)?;
+            push_tlv(chain, raw.tag, &raw.value)?;
         }
     }
-    if !chain.is_empty() {
+    if chain.len() > start {
         chain.push(TAG_NOP as u8);
     }
-    Ok(chain)
+    Ok(())
 }
 
 fn serialize_leaf_node(entries: &[StagedEntry]) -> Result<Vec<u8>, VzError> {
-    let mut name_raws = Vec::with_capacity(entries.len());
-    let mut ext_raws = Vec::with_capacity(entries.len());
-    let mut total_name_bytes = 0usize;
-    let mut total_ext_bytes = 1usize; // byte 0 reserved EXT_META_NONE
-
+    // Fast flat path: append directly to `name_pool` and `ext_meta_pool` assuming `pool_shift == 0`
+    // (`len <= 65_536`), falling back to `pack_pool` only when a huge entry forces shifting.
+    let mut name_pool = Vec::with_capacity(entries.len().saturating_mul(16));
+    let mut name_offs = Vec::with_capacity(entries.len());
+    let mut name_overflow = false;
     for e in entries {
-        let mut nb = Vec::with_capacity(8 + e.basename.len());
-        push_lp_bytes(&mut nb, e.basename.as_bytes())?;
-        total_name_bytes += nb.len();
-        name_raws.push(nb);
-
-        let eb = build_entry_ext_chain(e)?;
-        total_ext_bytes += eb.len();
-        ext_raws.push(eb);
+        let off = name_pool.len();
+        if off > u16::MAX as usize {
+            name_overflow = true;
+        }
+        name_offs.push(off as u16);
+        push_lp_bytes(&mut name_pool, e.basename.as_bytes())?;
+    }
+    if name_overflow || name_pool.len() > 65_536 {
+        let mut name_raws = Vec::with_capacity(entries.len());
+        let mut total_name_bytes = 0usize;
+        for e in entries {
+            let mut nb = Vec::with_capacity(8 + e.basename.len());
+            push_lp_bytes(&mut nb, e.basename.as_bytes())?;
+            total_name_bytes += nb.len();
+            name_raws.push(nb);
+        }
+        (name_pool, name_offs) = pack_pool(&name_raws, total_name_bytes, false)?;
     }
 
-    // Converge on pool_shift for NamePool and ExtMetaPool.
-    let (name_pool, name_offs) = pack_pool(&name_raws, total_name_bytes, false)?;
-    let (ext_meta_pool, ext_offs) = pack_pool(&ext_raws, total_ext_bytes, true)?;
+    let mut ext_meta_pool = Vec::new();
+    let mut ext_offs = Vec::with_capacity(entries.len());
+    let mut ext_overflow = false;
+    for e in entries {
+        if ext_meta_pool.is_empty() {
+            ext_meta_pool.push(0x00); // byte 0 reserved EXT_META_NONE
+        }
+        let before = ext_meta_pool.len();
+        append_entry_ext_chain(e, &mut ext_meta_pool)?;
+        if ext_meta_pool.len() == before {
+            ext_offs.push(0);
+        } else {
+            if before > u16::MAX as usize {
+                ext_overflow = true;
+            }
+            ext_offs.push(before as u16);
+        }
+    }
+    if ext_meta_pool.len() == 1 && ext_offs.iter().all(|&o| o == 0) {
+        ext_meta_pool.clear();
+    } else if ext_overflow || ext_meta_pool.len() > 65_536 {
+        let mut ext_raws = Vec::with_capacity(entries.len());
+        let mut total_ext_bytes = 1usize;
+        for e in entries {
+            let mut eb = Vec::new();
+            append_entry_ext_chain(e, &mut eb)?;
+            total_ext_bytes += eb.len();
+            ext_raws.push(eb);
+        }
+        (ext_meta_pool, ext_offs) = pack_pool(&ext_raws, total_ext_bytes, true)?;
+    }
 
     let entries_len = entries.len() * DirEntry::SIZE;
     let total_len = LeafNodeHeader::SIZE + entries_len + name_pool.len() + ext_meta_pool.len();

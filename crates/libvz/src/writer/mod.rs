@@ -13,15 +13,14 @@ pub use inplace_compact::{
 pub use lsm_append::LsmAppendWriter;
 pub use pipe::{PipeFinalizeInfo, VzPipeWriter, finalize_pipe_archive};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use btree_build::{
     BootCommitSpec, align_up_64, build_btree_index, build_registry_bytes, commit_boot_block,
-    mark_hash_collisions,
+    sort_and_mark_hash_collisions,
 };
 use emitter::{ClusterEmitter, StagedEntry};
-use crate::btree::key128_cmp;
 use crate::codec::{
     CryptoContext, EncryptionKey, ZstdDictCache, compress_payload_into_with_cache,
     compress_payload_with_cache,
@@ -30,6 +29,7 @@ use crate::error::VzError;
 use crate::ext_meta::{
     ChunkExtent, ColChunkStats, DataManifestHeader, DictEntry, ExtCodecMeta, OwnerEntry, RawTlv,
     SchemaEntry, SchemaLinkMeta, SparseExtent, Xattr, split_archive_path,
+    split_archive_path_borrowed,
 };
 use crate::hash::{AlgoHasher, PathHasher};
 use crate::wire::{
@@ -181,7 +181,9 @@ pub struct VzWriter<W: Write + Seek> {
     dict_cache: ZstdDictCache,
     target_generation: u64,
     entries: Vec<StagedEntry>,
-    path_to_idx: HashMap<String, usize>,
+    seen_hashes: HashMap<(u64, u64), usize>,
+    hash_collision_buckets: HashMap<(u64, u64), Vec<usize>>,
+    inflight_streamed: HashSet<(String, String)>,
     owners: Vec<OwnerEntry>,
     owner_map: HashMap<(u32, u32, String, String), u8>,
     next_entry_id: u64,
@@ -251,7 +253,9 @@ impl<W: Write + Seek> VzWriter<W> {
             dict_cache,
             target_generation: 1,
             entries: Vec::new(),
-            path_to_idx: HashMap::new(),
+            seen_hashes: HashMap::new(),
+            hash_collision_buckets: HashMap::new(),
+            inflight_streamed: HashSet::new(),
             owners,
             owner_map,
             next_entry_id: 1,
@@ -274,11 +278,57 @@ impl<W: Write + Seek> VzWriter<W> {
         Ok(h)
     }
 
-    fn norm_path(parent_path: &str, basename: &str) -> String {
-        if parent_path == "/" {
-            format!("/{basename}")
-        } else {
-            format!("{parent_path}/{basename}")
+    fn find_finalized_entry_idx(
+        &self,
+        parent: &str,
+        base: &str,
+        parent_hash: u64,
+        name_hash: u64,
+    ) -> Option<usize> {
+        let &idx = self.seen_hashes.get(&(parent_hash, name_hash))?;
+        if idx != usize::MAX {
+            let e = &self.entries[idx];
+            if e.parent_path == parent && e.basename == base {
+                return Some(idx);
+            }
+            return None;
+        }
+        self.hash_collision_buckets
+            .get(&(parent_hash, name_hash))?
+            .iter()
+            .copied()
+            .find(|&i| self.entries[i].parent_path == parent && self.entries[i].basename == base)
+    }
+
+    fn contains_path(&self, parent: &str, base: &str, parent_hash: u64, name_hash: u64) -> bool {
+        if self
+            .find_finalized_entry_idx(parent, base, parent_hash, name_hash)
+            .is_some()
+        {
+            return true;
+        }
+        !self.inflight_streamed.is_empty()
+            && self
+                .inflight_streamed
+                .iter()
+                .any(|(p, b)| p == parent && b == base)
+    }
+
+    fn insert_finalized_entry_hash(&mut self, parent_hash: u64, name_hash: u64, idx: usize) {
+        match self.seen_hashes.entry((parent_hash, name_hash)) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(idx);
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let prev = *o.get();
+                if prev != usize::MAX {
+                    *o.get_mut() = usize::MAX;
+                    self.hash_collision_buckets
+                        .insert((parent_hash, name_hash), vec![prev, idx]);
+                } else if let Some(bucket) = self.hash_collision_buckets.get_mut(&(parent_hash, name_hash)) {
+                    bucket.push(idx);
+                }
+            }
         }
     }
 
@@ -373,27 +423,22 @@ impl<W: Write + Seek> VzWriter<W> {
 
     /// Adds a hardlink sharing the exact inode (`entry_id`) and payload of an already-added entry.
     pub fn add_hardlink(&mut self, link_path: &str, target_path: &str) -> Result<(), VzError> {
-        let (t_parent, t_base) = split_archive_path(target_path)?;
-        let norm_target = if t_parent == "/" {
-            format!("/{t_base}")
-        } else {
-            format!("{t_parent}/{t_base}")
-        };
-        let &idx = self.path_to_idx.get(&norm_target).ok_or(VzError::NotFound)?;
-        if idx == usize::MAX {
-            return Err(VzError::NotFound);
-        }
+        let (t_parent, t_base) = split_archive_path_borrowed(target_path)?;
+        let t_parent_hash = self.hash_parent_cached(&t_parent)?;
+        let t_name_hash = self.hasher.hash(t_base.as_bytes())?;
+        let idx = self
+            .find_finalized_entry_idx(&t_parent, &t_base, t_parent_hash, t_name_hash)
+            .ok_or(VzError::NotFound)?;
         let target = self.entries[idx].clone();
 
         let (parent_path, basename) = split_archive_path(link_path)?;
-        let norm_link = Self::norm_path(&parent_path, &basename);
-        if self.path_to_idx.contains_key(&norm_link) {
-            return Err(VzError::AlreadyExists);
-        }
         let parent_hash = self.hash_parent_cached(&parent_path)?;
         let name_hash = self.hasher.hash(basename.as_bytes())?;
+        if self.contains_path(&parent_path, &basename, parent_hash, name_hash) {
+            return Err(VzError::AlreadyExists);
+        }
         let new_idx = self.entries.len();
-        self.path_to_idx.insert(norm_link, new_idx);
+        self.insert_finalized_entry_hash(parent_hash, name_hash, new_idx);
         self.entries.push(StagedEntry {
             parent_path,
             basename,
@@ -500,14 +545,16 @@ impl<W: Write + Seek> VzWriter<W> {
         if (opts.kind & KIND_MASK) == KIND_DIR {
             return Err(VzError::InvalidInput);
         }
-        let (parent_path, basename) = split_archive_path(path)?;
-        let norm_path = Self::norm_path(&parent_path, &basename);
-        if self.path_to_idx.contains_key(&norm_path) {
+        let (parent_cow, base_cow) = split_archive_path_borrowed(path)?;
+        let parent_hash = self.hash_parent_cached(&parent_cow)?;
+        let name_hash = self.hasher.hash(base_cow.as_bytes())?;
+        if self.contains_path(&parent_cow, &base_cow, parent_hash, name_hash) {
             return Err(VzError::AlreadyExists);
         }
-        self.path_to_idx.insert(norm_path, usize::MAX);
-        let parent_hash = self.hash_parent_cached(&parent_path)?;
-        let name_hash = self.hasher.hash(basename.as_bytes())?;
+        let parent_path = parent_cow.into_owned();
+        let basename = base_cow.into_owned();
+        self.inflight_streamed
+            .insert((parent_path.clone(), basename.clone()));
         let entry_id = self.alloc_entry_id(opts.entry_id);
         let codec = opts.codec.unwrap_or(self.config.default_codec) & CODEC_MASK;
         let ext_codec = opts.dict_id.map(|dict_id| ExtCodecMeta {
@@ -611,9 +658,11 @@ impl<W: Write + Seek> VzWriter<W> {
     /// Finalizes a chunk-streamed [`VzStreamedFile`], automatically using inline or single-cluster
     /// encoding if fewer than 1 full chunk was written, or writing `TAG_CHUNK_TABLE` for multi-cluster.
     pub fn finish_streamed_file(&mut self, mut sf: VzStreamedFile) -> Result<(), VzError> {
-        let norm_path = Self::norm_path(&sf.parent_path, &sf.basename);
+        if !self.inflight_streamed.is_empty() {
+            self.inflight_streamed
+                .retain(|(p, b)| p != &sf.parent_path || b != &sf.basename);
+        }
         if sf.extents.is_empty() {
-            self.path_to_idx.remove(&norm_path);
             return self.add_entry_bytes(&sf.path, &sf.pending, sf.opts);
         }
         if !sf.pending.is_empty() {
@@ -636,7 +685,7 @@ impl<W: Write + Seek> VzWriter<W> {
             extra: sf.opts.schema_extra,
         });
         let new_idx = self.entries.len();
-        self.path_to_idx.insert(norm_path, new_idx);
+        self.insert_finalized_entry_hash(sf.parent_hash, sf.name_hash, new_idx);
         self.entries.push(StagedEntry {
             parent_path: sf.parent_path,
             basename: sf.basename,
@@ -669,22 +718,21 @@ impl<W: Write + Seek> VzWriter<W> {
         &mut self,
         parent_path: String,
         basename: String,
-        norm_path: String,
+        parent_hash: u64,
+        name_hash: u64,
         opts: EntryOptions,
         payload: DirPayload,
         entry_id: u64,
         flags_and_codec: u8,
         ext_codec: Option<ExtCodecMeta>,
     ) -> Result<(), VzError> {
-        let parent_hash = self.hash_parent_cached(&parent_path)?;
-        let name_hash = self.hasher.hash(basename.as_bytes())?;
         let (owner_idx, ext_owner) = self.register_owner(opts.owner);
         let schema_link = opts.schema_id.map(|schema_id| SchemaLinkMeta {
             schema_id,
             extra: opts.schema_extra,
         });
         let new_idx = self.entries.len();
-        self.path_to_idx.insert(norm_path, new_idx);
+        self.insert_finalized_entry_hash(parent_hash, name_hash, new_idx);
         self.entries.push(StagedEntry {
             parent_path,
             basename,
@@ -724,11 +772,7 @@ impl<W: Write + Seek> VzWriter<W> {
         let est_unenc_len = compressed.len() + if self.crypto.is_some() { 40 } else { 0 };
         let stats_len_est = col_stats.map_or(0, |_| 64);
         let est_add = 16 + DataManifestHeader::SIZE + stats_len_est + 64 + est_unenc_len + 40;
-        if !self.emitter.pending_body.is_empty()
-            && self.emitter.pending_body.len() + est_add > self.emitter.target_cluster_size
-        {
-            self.emitter.flush_pending_data_cluster()?;
-        }
+        self.emitter.ensure_pending_capacity(est_add)?;
         let seq = self.emitter.cluster_seq;
         let (cluster_off, in_cluster_offset, actual_seq, stored_len) =
             if let Some((_, ref ctx)) = self.crypto {
@@ -883,11 +927,14 @@ impl<W: Write + Seek> VzWriter<W> {
             let pre = iter.next().flatten();
             if let Some(comp_res) = pre {
                 let compressed = comp_res?;
-                let (parent_path, basename) = split_archive_path(path)?;
-                let norm_path = Self::norm_path(&parent_path, &basename);
-                if self.path_to_idx.contains_key(&norm_path) {
+                let (parent_cow, base_cow) = split_archive_path_borrowed(path)?;
+                let parent_hash = self.hash_parent_cached(&parent_cow)?;
+                let name_hash = self.hasher.hash(base_cow.as_bytes())?;
+                if self.contains_path(&parent_cow, &base_cow, parent_hash, name_hash) {
                     return Err(VzError::AlreadyExists);
                 }
+                let parent_path = parent_cow.into_owned();
+                let basename = base_cow.into_owned();
                 let entry_id = self.alloc_entry_id(opts.entry_id);
                 let (_, ext_codec, effective_codec) = self.effective_codec_for(opts);
                 if opts.col_stats.is_some() {
@@ -908,7 +955,8 @@ impl<W: Write + Seek> VzWriter<W> {
                 self.stage_entry_record(
                     parent_path,
                     basename,
-                    norm_path,
+                    parent_hash,
+                    name_hash,
                     opts.clone(),
                     payload,
                     entry_id,
@@ -928,11 +976,14 @@ impl<W: Write + Seek> VzWriter<W> {
         data: &[u8],
         opts: EntryOptions,
     ) -> Result<(), VzError> {
-        let (parent_path, basename) = split_archive_path(path)?;
-        let norm_path = Self::norm_path(&parent_path, &basename);
-        if self.path_to_idx.contains_key(&norm_path) {
+        let (parent_cow, base_cow) = split_archive_path_borrowed(path)?;
+        let parent_hash = self.hash_parent_cached(&parent_cow)?;
+        let name_hash = self.hasher.hash(base_cow.as_bytes())?;
+        if self.contains_path(&parent_cow, &base_cow, parent_hash, name_hash) {
             return Err(VzError::AlreadyExists);
         }
+        let parent_path = parent_cow.into_owned();
+        let basename = base_cow.into_owned();
         let entry_id = self.alloc_entry_id(opts.entry_id);
         let is_special = matches!(
             opts.kind & KIND_MASK,
@@ -1210,7 +1261,8 @@ impl<W: Write + Seek> VzWriter<W> {
         self.stage_entry_record(
             parent_path,
             basename,
-            norm_path,
+            parent_hash,
+            name_hash,
             opts,
             payload,
             entry_id,
@@ -1224,12 +1276,7 @@ impl<W: Write + Seek> VzWriter<W> {
     pub fn finish(mut self) -> Result<W, VzError> {
         self.emitter.flush_pending_data_cluster()?;
 
-        mark_hash_collisions(&mut self.entries);
-        self.entries.sort_by(|a, b| {
-            key128_cmp(a.parent_hash, a.name_hash, b.parent_hash, b.name_hash)
-                .then_with(|| a.parent_path.cmp(&b.parent_path))
-                .then_with(|| a.basename.cmp(&b.basename))
-        });
+        sort_and_mark_hash_collisions(&mut self.entries);
 
         let total_entries = self
             .entries

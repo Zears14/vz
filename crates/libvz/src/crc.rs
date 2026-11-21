@@ -133,6 +133,77 @@ pub fn crc32c_sw(data: &[u8]) -> u32 {
     !crc32c_update_sw(0xFFFF_FFFF, data)
 }
 
+#[inline]
+const fn gf2_matrix_times_const(mat: &[u32; 32], mut vec: u32) -> u32 {
+    let mut sum = 0u32;
+    let mut idx = 0usize;
+    while vec != 0 {
+        if (vec & 1) != 0 {
+            sum ^= mat[idx];
+        }
+        vec >>= 1;
+        idx += 1;
+    }
+    sum
+}
+
+#[inline]
+const fn gf2_matrix_square_const(mat: &[u32; 32]) -> [u32; 32] {
+    let mut square = [0u32; 32];
+    let mut n = 0usize;
+    while n < 32 {
+        square[n] = gf2_matrix_times_const(mat, mat[n]);
+        n += 1;
+    }
+    square
+}
+
+/// Multiplies a CRC32C state `crc` by `x^(8 * len)` modulo the Castagnoli polynomial (`0x1EDC_6F41`).
+///
+/// Equivalent to feeding `len` zero bytes through the CRC shift register without hashing them.
+pub const fn crc32c_shift_zeros(mut crc: u32, mut len: usize) -> u32 {
+    if len == 0 {
+        return crc;
+    }
+    let mut odd = [0u32; 32];
+    odd[0] = CRC32C_POLY_REFLECTED;
+    let mut row = 1u32;
+    let mut n = 1usize;
+    while n < 32 {
+        odd[n] = row;
+        row <<= 1;
+        n += 1;
+    }
+    let mut even = gf2_matrix_square_const(&odd);
+    odd = gf2_matrix_square_const(&even);
+    while len != 0 {
+        even = gf2_matrix_square_const(&odd);
+        if (len & 1) != 0 {
+            crc = gf2_matrix_times_const(&even, crc);
+        }
+        len >>= 1;
+        if len == 0 {
+            break;
+        }
+        odd = gf2_matrix_square_const(&even);
+        if (len & 1) != 0 {
+            crc = gf2_matrix_times_const(&odd, crc);
+        }
+        len >>= 1;
+    }
+    crc
+}
+
+/// Combines two independent Castagnoli CRC32C checksums (`crc1 = crc32c(a)`, `crc2 = crc32c(b)`)
+/// into `crc32c(a || b)` in `O(log len2)` time without re-reading `a` or `b`.
+#[inline]
+pub const fn crc32c_combine(crc1: u32, crc2: u32, len2: usize) -> u32 {
+    if len2 == 0 {
+        return crc1;
+    }
+    crc32c_shift_zeros(crc1, len2) ^ crc2
+}
+
 /// Streaming Castagnoli CRC32C update.
 ///
 /// Pass `0xFFFF_FFFF` as initial `crc`, and finalize with `!crc`. Uses SSE4.2 (`x86`/`x86_64`)
@@ -236,4 +307,23 @@ pub fn hash64(data: &[u8]) -> u64 {
     h = h.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
     h ^= h >> 33;
     h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_crc32c_combine_matches_concat_all_lengths() {
+        let mut buf = [0u8; 4099];
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = ((i * 73 + 19) & 0xFF) as u8;
+        }
+        for &split in &[0usize, 1, 2, 7, 15, 16, 63, 64, 127, 511, 1024, 2048, 4099] {
+            let (a, b) = buf.split_at(split);
+            let ca = crc32c(a);
+            let cb = crc32c(b);
+            assert_eq!(crc32c_combine(ca, cb, b.len()), crc32c(&buf), "split={split}");
+        }
+    }
 }

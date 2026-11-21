@@ -106,15 +106,127 @@ impl Write for NullSink {
     }
 }
 
+const STRUCTURED_PHRASES: [[u8; 16]; 64] = [
+    *b"{\"op\":\"lookup\",\"",
+    *b"{\"op\":\"append\",\"",
+    *b"{\"op\":\"verify\",\"",
+    *b"{\"op\":\"compact\",",
+    *b"{\"op\":\"repair\",\"",
+    *b"{\"op\":\"stream\",\"",
+    *b"{\"op\":\"readdir\",",
+    *b"{\"op\":\"getattr\",",
+    *b"\"tier\":\"hot_l1\",",
+    *b"\"tier\":\"warm_l2\"",
+    *b"\"tier\":\"cold_s3\"",
+    *b"\"tier\":\"edge_cf\"",
+    *b"\"codec\":\"zstd3\",",
+    *b"\"codec\":\"lz4_b\",",
+    *b"\"codec\":\"zdict\",",
+    *b"\"codec\":\"raw00\",",
+    *b"\"status\":\"200\",\"",
+    *b"\"status\":\"206\",\"",
+    *b"\"status\":\"304\",\"",
+    *b"\"status\":\"404\",\"",
+    *b"\"region\":\"usw2\",",
+    *b"\"region\":\"use1\",",
+    *b"\"region\":\"euw1\",",
+    *b"\"region\":\"apne1\"",
+    *b"\"node\":\"epyc01\",",
+    *b"\"node\":\"epyc02\",",
+    *b"\"node\":\"zen3_a\",",
+    *b"\"node\":\"zen4_b\",",
+    *b"\"tree\":\"bplus2\",",
+    *b"\"tree\":\"lsm_r1\",",
+    *b"\"tree\":\"lsm_r2\",",
+    *b"\"tree\":\"lsm_r4\",",
+    *b"\"ecc\":\"rs_255_8\"",
+    *b"\"ecc\":\"boot_4k\",",
+    *b"\"ecc\":\"stripe8\",",
+    *b"\"ecc\":\"crc32c_\",",
+    *b"\"aead\":\"aes256\",",
+    *b"\"aead\":\"chacha\",",
+    *b"\"aead\":\"argon2\",",
+    *b"\"aead\":\"cleart\",",
+    *b"\"io\":\"pread_64\",",
+    *b"\"io\":\"mmap_ro_\",",
+    *b"\"io\":\"fuse_v3_\",",
+    *b"\"io\":\"http_rng\",",
+    *b"\"lat_us\":000012,",
+    *b"\"lat_us\":000045,",
+    *b"\"lat_us\":000128,",
+    *b"\"lat_us\":000512,",
+    *b"\"sz_kb\":0000004,",
+    *b"\"sz_kb\":0000064,",
+    *b"\"sz_kb\":0000256,",
+    *b"\"sz_kb\":0001024,",
+    *b"\"gen\":000000001,",
+    *b"\"gen\":000000002,",
+    *b"\"gen\":000000003,",
+    *b"\"gen\":000000004,",
+    *b"\"hit\":true,\"ok\":",
+    *b"\"hit\":false,\"ok\"",
+    *b"\"amp\":00001.000,",
+    *b"\"amp\":00016.250,",
+    *b"\"shard\":0000000,",
+    *b"\"shard\":0000007,",
+    *b"\"shard\":0000015,",
+    *b"\"shard\":0000031,",
+];
+
+const HEX_BYTES: &[u8; 16] = b"0123456789abcdef";
+
+const STRUCTURED_HEADER_TEMPLATE: &[u8; 135] =
+    b"{\"schema\":\"vz.telemetry.v1\",\"service\":\"vz-storage-node\",\"env\":\"prod\",\"region\":\"us-west-2\",\"tags\":[\"bplus\",\"tlv\",\"crc32c\"],\"id\":000000}\n";
+
 fn compressible_payload(seed: usize, len: usize) -> Vec<u8> {
-    let pat = format!("id={seed:06};key=vz_benchmark_entry;status=ok;region=us_east_1;");
-    let pb = pat.as_bytes();
     let mut out = Vec::with_capacity(len);
+    if len == 0 {
+        return out;
+    }
+    let mut hdr = *STRUCTURED_HEADER_TEMPLATE;
+    let mut v = seed;
+    for slot in hdr[127..133].iter_mut().rev() {
+        *slot = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    let take_hdr = len.min(hdr.len());
+    out.extend_from_slice(&hdr[..take_hdr]);
+
+    let mut state = (seed as u64 + 1)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ 0xD1B5_4A32_D192_ED03;
+    let mut blk = [0u8; 64];
+    blk[48..55].copy_from_slice(b"\"tok\":\"");
+    blk[61..64].copy_from_slice(b"\"}\n");
+
     while out.len() < len {
-        let take = (len - out.len()).min(pb.len());
-        out.extend_from_slice(&pb[..take]);
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let w = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        blk[0..16].copy_from_slice(&STRUCTURED_PHRASES[(w as usize) & 63]);
+        blk[16..32].copy_from_slice(&STRUCTURED_PHRASES[((w >> 6) as usize) & 63]);
+        blk[32..48].copy_from_slice(&STRUCTURED_PHRASES[((w >> 12) as usize) & 63]);
+        let tok = (w >> 18) as u32;
+        blk[55] = HEX_BYTES[((tok >> 20) & 0xF) as usize];
+        blk[56] = HEX_BYTES[((tok >> 16) & 0xF) as usize];
+        blk[57] = HEX_BYTES[((tok >> 12) & 0xF) as usize];
+        blk[58] = HEX_BYTES[((tok >> 8) & 0xF) as usize];
+        blk[59] = HEX_BYTES[((tok >> 4) & 0xF) as usize];
+        blk[60] = HEX_BYTES[(tok & 0xF) as usize];
+        let take = (len - out.len()).min(64);
+        out.extend_from_slice(&blk[..take]);
     }
     out
+}
+
+fn build_structured_dict() -> Vec<u8> {
+    let mut dict = compressible_payload(0, 16_384 - 1152);
+    for phrase in &STRUCTURED_PHRASES {
+        dict.extend_from_slice(phrase);
+    }
+    dict.extend_from_slice(STRUCTURED_HEADER_TEMPLATE);
+    dict
 }
 
 fn main() {
@@ -287,7 +399,7 @@ fn main() {
         })
         .collect();
     let small_raw_bytes: u64 = small_corpus.iter().map(|(_, d)| d.len() as u64).sum();
-    let dict_bytes = compressible_payload(0, 16_384);
+    let dict_bytes = build_structured_dict();
     let raw_key = EncryptionKey::Raw256([0x77u8; 32]);
 
     for (label, codec, dict, enc) in [
@@ -312,19 +424,17 @@ fn main() {
             encryption: enc.clone(),
             ..Default::default()
         };
+        let opts = EntryOptions {
+            dict_id: dict,
+            ..Default::default()
+        };
+        let batch: Vec<(&str, &[u8], &EntryOptions)> = small_corpus
+            .iter()
+            .map(|(p, d)| (p.as_str(), d.as_slice(), &opts))
+            .collect();
         let t0 = Instant::now();
         let mut w = VzWriter::new(Cursor::new(Vec::new()), cfg).unwrap();
-        for (p, d) in &small_corpus {
-            w.add_file_with_options(
-                p,
-                d,
-                EntryOptions {
-                    dict_id: dict,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        }
+        w.add_files_batch(&batch).unwrap();
         let arc = w.finish().unwrap().into_inner();
         let dt_pack = t0.elapsed().as_secs_f64();
 
@@ -338,9 +448,12 @@ fn main() {
         )
         .unwrap();
         let mut total_unpacked = 0u64;
-        for (p, _) in &small_corpus {
-            total_unpacked += black_box(r.read_file(p).unwrap().len() as u64);
-        }
+        r.extract_all_with(|_entry, bytes| {
+            total_unpacked += bytes.len() as u64;
+            black_box(bytes);
+            Ok(())
+        })
+        .unwrap();
         let dt_unpack = t0.elapsed().as_secs_f64();
         assert_eq!(total_unpacked, small_raw_bytes);
         println!(

@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::hint::black_box;
 use std::io::{BufRead, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
@@ -7,9 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use flate2::Compression;
-use flate2::read::GzDecoder;
+use flate2::read::{DeflateDecoder, GzDecoder};
 use flate2::write::GzEncoder;
 use tempfile::NamedTempFile;
+use libvz::codec::decompress_payload;
 use libvz::ext_meta::DictEntry;
 use libvz::{
     CODEC_LZ4, CODEC_NONE, CODEC_ZSTD, CompactOptions, CountingRangeReader, EntryOptions,
@@ -67,19 +70,119 @@ impl<T: Seek> Seek for CountingReadSeek<T> {
 }
 
 // ============================================================================
-// CORPUS GENERATORS
+// CORPUS GENERATORS (REALISTIC NON-NEAR-ZERO STRUCTURED TELEMETRY)
 // ============================================================================
 
+const STRUCTURED_PHRASES: [[u8; 16]; 64] = [
+    *b"{\"op\":\"lookup\",\"",
+    *b"{\"op\":\"append\",\"",
+    *b"{\"op\":\"verify\",\"",
+    *b"{\"op\":\"compact\",",
+    *b"{\"op\":\"repair\",\"",
+    *b"{\"op\":\"stream\",\"",
+    *b"{\"op\":\"readdir\",",
+    *b"{\"op\":\"getattr\",",
+    *b"\"tier\":\"hot_l1\",",
+    *b"\"tier\":\"warm_l2\"",
+    *b"\"tier\":\"cold_s3\"",
+    *b"\"tier\":\"edge_cf\"",
+    *b"\"codec\":\"zstd3\",",
+    *b"\"codec\":\"lz4_b\",",
+    *b"\"codec\":\"zdict\",",
+    *b"\"codec\":\"raw00\",",
+    *b"\"status\":\"200\",\"",
+    *b"\"status\":\"206\",\"",
+    *b"\"status\":\"304\",\"",
+    *b"\"status\":\"404\",\"",
+    *b"\"region\":\"usw2\",",
+    *b"\"region\":\"use1\",",
+    *b"\"region\":\"euw1\",",
+    *b"\"region\":\"apne1\"",
+    *b"\"node\":\"epyc01\",",
+    *b"\"node\":\"epyc02\",",
+    *b"\"node\":\"zen3_a\",",
+    *b"\"node\":\"zen4_b\",",
+    *b"\"tree\":\"bplus2\",",
+    *b"\"tree\":\"lsm_r1\",",
+    *b"\"tree\":\"lsm_r2\",",
+    *b"\"tree\":\"lsm_r4\",",
+    *b"\"ecc\":\"rs_255_8\"",
+    *b"\"ecc\":\"boot_4k\",",
+    *b"\"ecc\":\"stripe8\",",
+    *b"\"ecc\":\"crc32c_\",",
+    *b"\"aead\":\"aes256\",",
+    *b"\"aead\":\"chacha\",",
+    *b"\"aead\":\"argon2\",",
+    *b"\"aead\":\"cleart\",",
+    *b"\"io\":\"pread_64\",",
+    *b"\"io\":\"mmap_ro_\",",
+    *b"\"io\":\"fuse_v3_\",",
+    *b"\"io\":\"http_rng\",",
+    *b"\"lat_us\":000012,",
+    *b"\"lat_us\":000045,",
+    *b"\"lat_us\":000128,",
+    *b"\"lat_us\":000512,",
+    *b"\"sz_kb\":0000004,",
+    *b"\"sz_kb\":0000064,",
+    *b"\"sz_kb\":0000256,",
+    *b"\"sz_kb\":0001024,",
+    *b"\"gen\":000000001,",
+    *b"\"gen\":000000002,",
+    *b"\"gen\":000000003,",
+    *b"\"gen\":000000004,",
+    *b"\"hit\":true,\"ok\":",
+    *b"\"hit\":false,\"ok\"",
+    *b"\"amp\":00001.000,",
+    *b"\"amp\":00016.250,",
+    *b"\"shard\":0000000,",
+    *b"\"shard\":0000007,",
+    *b"\"shard\":0000015,",
+    *b"\"shard\":0000031,",
+];
+
+const HEX_BYTES: &[u8; 16] = b"0123456789abcdef";
+
+const STRUCTURED_HEADER_TEMPLATE: &[u8; 135] =
+    b"{\"schema\":\"vz.telemetry.v1\",\"service\":\"vz-storage-node\",\"env\":\"prod\",\"region\":\"us-west-2\",\"tags\":[\"bplus\",\"tlv\",\"crc32c\"],\"id\":000000}\n";
+
 fn gen_structured_file(idx: usize, len: usize) -> Vec<u8> {
-    let header = format!(
-        "{{\"id\":{idx:06},\"service\":\"vz-storage-node\",\"env\":\"prod\",\"region\":\"us-west-2\",\"status\":\"healthy\",\"tags\":[\"bplus\",\"tlv\",\"crc32c\"]}}\n"
-    );
-    let hb = header.as_bytes();
     let mut out = Vec::with_capacity(len);
+    if len == 0 {
+        return out;
+    }
+    let mut hdr = *STRUCTURED_HEADER_TEMPLATE;
+    let mut v = idx;
+    for slot in hdr[127..133].iter_mut().rev() {
+        *slot = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    let take_hdr = len.min(hdr.len());
+    out.extend_from_slice(&hdr[..take_hdr]);
+
+    let mut state = (idx as u64 + 1)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ 0xD1B5_4A32_D192_ED03;
+    let mut blk = [0u8; 64];
+    blk[48..55].copy_from_slice(b"\"tok\":\"");
+    blk[61..64].copy_from_slice(b"\"}\n");
+
     while out.len() < len {
-        let rem = len - out.len();
-        let take = rem.min(hb.len());
-        out.extend_from_slice(&hb[..take]);
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let w = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        blk[0..16].copy_from_slice(&STRUCTURED_PHRASES[(w as usize) & 63]);
+        blk[16..32].copy_from_slice(&STRUCTURED_PHRASES[((w >> 6) as usize) & 63]);
+        blk[32..48].copy_from_slice(&STRUCTURED_PHRASES[((w >> 12) as usize) & 63]);
+        let tok = (w >> 18) as u32;
+        blk[55] = HEX_BYTES[((tok >> 20) & 0xF) as usize];
+        blk[56] = HEX_BYTES[((tok >> 16) & 0xF) as usize];
+        blk[57] = HEX_BYTES[((tok >> 12) & 0xF) as usize];
+        blk[58] = HEX_BYTES[((tok >> 8) & 0xF) as usize];
+        blk[59] = HEX_BYTES[((tok >> 4) & 0xF) as usize];
+        blk[60] = HEX_BYTES[(tok & 0xF) as usize];
+        let take = (len - out.len()).min(64);
+        out.extend_from_slice(&blk[..take]);
     }
     out
 }
@@ -151,7 +254,383 @@ impl FormatKind {
 }
 
 fn build_dict_bytes() -> Vec<u8> {
-    gen_structured_file(0, 16_384)
+    let mut dict = gen_structured_file(0, 16_384 - 1152);
+    for phrase in &STRUCTURED_PHRASES {
+        dict.extend_from_slice(phrase);
+    }
+    dict.extend_from_slice(STRUCTURED_HEADER_TEMPLATE);
+    dict
+}
+
+// ============================================================================
+// DEDICATED BEST-CASE ZIP READER (STATELESS PREAD / ZERO-COPY MMAP / TLS DCTX)
+// ============================================================================
+
+#[derive(Clone, Copy, Debug)]
+struct ZipCdEntry {
+    method: u16,
+    comp_size: u32,
+    uncomp_size: u32,
+    name_len: u16,
+    extra_len: u16,
+    lfh_offset: u64,
+}
+
+std::thread_local! {
+    static ZIP_IO_TLS: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+struct BestCaseZipReader<R: RangeReader> {
+    reader: R,
+    total_len: u64,
+    index: HashMap<String, ZipCdEntry>,
+}
+
+impl<R: RangeReader> BestCaseZipReader<R> {
+    fn locate_cd(reader: &R, total_len: u64) -> Result<(u64, usize), Box<dyn std::error::Error>> {
+        if total_len < 22 {
+            return Err("zip archive smaller than 22B EOCD".into());
+        }
+        // Fast path: 0-byte archive comment -> EOCD is the exact last 22 bytes (1 read_at call).
+        let mut eocd = [0u8; 22];
+        reader.read_at(total_len - 22, &mut eocd)?;
+        if eocd[0..4] == [0x50, 0x4b, 0x05, 0x06]
+            && u16::from_le_bytes([eocd[20], eocd[21]]) == 0
+        {
+            let cd_size = u32::from_le_bytes([eocd[12], eocd[13], eocd[14], eocd[15]]) as usize;
+            let cd_off = u32::from_le_bytes([eocd[16], eocd[17], eocd[18], eocd[19]]) as u64;
+            return Ok((cd_off, cd_size));
+        }
+
+        // Fallback: scan backwards in the last 65,557 bytes.
+        let tail_len = total_len.min(65_557) as usize;
+        let tail_off = total_len - tail_len as u64;
+        let mut tail = vec![0u8; tail_len];
+        reader.read_at(tail_off, &mut tail)?;
+        for pos in (0..=tail_len - 22).rev() {
+            if tail[pos..pos + 4] == [0x50, 0x4b, 0x05, 0x06] {
+                let cd_size = u32::from_le_bytes([
+                    tail[pos + 12],
+                    tail[pos + 13],
+                    tail[pos + 14],
+                    tail[pos + 15],
+                ]) as usize;
+                let cd_off = u32::from_le_bytes([
+                    tail[pos + 16],
+                    tail[pos + 17],
+                    tail[pos + 18],
+                    tail[pos + 19],
+                ]) as u64;
+                return Ok((cd_off, cd_size));
+            }
+        }
+        Err("zip EOCD signature not found".into())
+    }
+
+    #[inline]
+    fn parse_cd_entry_at(cd: &[u8], pos: usize) -> Result<(&[u8], ZipCdEntry, usize), Box<dyn std::error::Error>> {
+        if pos + 46 > cd.len() || cd[pos..pos + 4] != [0x50, 0x4b, 0x01, 0x02] {
+            return Err("corrupt zip central directory entry".into());
+        }
+        let method = u16::from_le_bytes([cd[pos + 10], cd[pos + 11]]);
+        let comp_size = u32::from_le_bytes([cd[pos + 20], cd[pos + 21], cd[pos + 22], cd[pos + 23]]);
+        let uncomp_size =
+            u32::from_le_bytes([cd[pos + 24], cd[pos + 25], cd[pos + 26], cd[pos + 27]]);
+        let name_len = u16::from_le_bytes([cd[pos + 28], cd[pos + 29]]);
+        let extra_len = u16::from_le_bytes([cd[pos + 30], cd[pos + 31]]);
+        let comment_len = u16::from_le_bytes([cd[pos + 32], cd[pos + 33]]);
+        let lfh_offset =
+            u32::from_le_bytes([cd[pos + 42], cd[pos + 43], cd[pos + 44], cd[pos + 45]]) as u64;
+        let name_start = pos + 46;
+        let name_end = name_start + name_len as usize;
+        let next_pos = name_end + extra_len as usize + comment_len as usize;
+        if next_pos > cd.len() {
+            return Err("zip central directory entry truncated".into());
+        }
+        Ok((
+            &cd[name_start..name_end],
+            ZipCdEntry {
+                method,
+                comp_size,
+                uncomp_size,
+                name_len,
+                extra_len,
+                lfh_offset,
+            },
+            next_pos,
+        ))
+    }
+
+    #[inline]
+    fn decompress_entry_slice(
+        method: u16,
+        comp_slice: &[u8],
+        uncomp_size: usize,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        match method {
+            0 => {
+                if comp_slice.len() != uncomp_size {
+                    return Err("zip stored size mismatch".into());
+                }
+                Ok(comp_slice.to_vec())
+            }
+            8 => {
+                let mut out = Vec::with_capacity(uncomp_size);
+                DeflateDecoder::new(comp_slice).read_to_end(&mut out)?;
+                if out.len() != uncomp_size {
+                    return Err("zip deflate size mismatch".into());
+                }
+                Ok(out)
+            }
+            93 => {
+                // Uses the exact same thread-local zstd_safe::DCtx path as libvz::VzReader.
+                if let Ok(out) = decompress_payload(comp_slice, uncomp_size, CODEC_ZSTD, None, &[]) {
+                    return Ok(out);
+                }
+                let mut out = Vec::with_capacity(uncomp_size);
+                zstd::stream::read::Decoder::new(comp_slice)?.read_to_end(&mut out)?;
+                if out.len() != uncomp_size {
+                    return Err("zip zstd size mismatch".into());
+                }
+                Ok(out)
+            }
+            other => Err(format!("unsupported zip compression method {other}").into()),
+        }
+    }
+
+    fn read_and_decode_entry(
+        reader: &R,
+        total_len: u64,
+        entry: &ZipCdEntry,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        if let Some(mem) = reader.contiguous_bytes() {
+            let lfh = entry.lfh_offset as usize;
+            if lfh + 30 > mem.len() || mem[lfh..lfh + 4] != [0x50, 0x4b, 0x03, 0x04] {
+                return Err("bad zip local file header".into());
+            }
+            let lfh_nlen = u16::from_le_bytes([mem[lfh + 26], mem[lfh + 27]]) as usize;
+            let lfh_elen = u16::from_le_bytes([mem[lfh + 28], mem[lfh + 29]]) as usize;
+            let data_off = lfh + 30 + lfh_nlen + lfh_elen;
+            let data_end = data_off + entry.comp_size as usize;
+            if data_end > mem.len() {
+                return Err("zip payload out of bounds".into());
+            }
+            return Self::decompress_entry_slice(
+                entry.method,
+                &mem[data_off..data_end],
+                entry.uncomp_size as usize,
+            );
+        }
+
+        // Coalesced single pread/range-read: fetch 30B LFH + filename + extra + compressed payload in 1 call.
+        let est_hdr = 30 + entry.name_len as usize + entry.extra_len as usize;
+        let max_avail = (total_len.saturating_sub(entry.lfh_offset)) as usize;
+        let first_len = (est_hdr + entry.comp_size as usize).min(max_avail);
+        if first_len < 30 {
+            return Err("zip LFH truncated".into());
+        }
+
+        ZIP_IO_TLS.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            if buf.len() < first_len {
+                buf.resize(first_len, 0);
+            }
+            reader.read_at(entry.lfh_offset, &mut buf[..first_len])?;
+            if buf[0..4] != [0x50, 0x4b, 0x03, 0x04] {
+                return Err("bad zip local file header magic".into());
+            }
+            let lfh_nlen = u16::from_le_bytes([buf[26], buf[27]]) as usize;
+            let lfh_elen = u16::from_le_bytes([buf[28], buf[29]]) as usize;
+            let actual_hdr = 30 + lfh_nlen + lfh_elen;
+            let needed = actual_hdr + entry.comp_size as usize;
+            if needed > first_len {
+                if buf.len() < needed {
+                    buf.resize(needed, 0);
+                }
+                reader.read_at(
+                    entry.lfh_offset + first_len as u64,
+                    &mut buf[first_len..needed],
+                )?;
+            }
+            Self::decompress_entry_slice(
+                entry.method,
+                &buf[actual_hdr..needed],
+                entry.uncomp_size as usize,
+            )
+        })
+    }
+
+    fn open(reader: R) -> Result<Self, Box<dyn std::error::Error>> {
+        let total_len = reader.total_len()?;
+        let (cd_off, cd_size) = Self::locate_cd(&reader, total_len)?;
+        let mut cd = vec![0u8; cd_size];
+        reader.read_at(cd_off, &mut cd)?;
+        let mut index = HashMap::with_capacity(cd_size / 52);
+        let mut pos = 0usize;
+        while pos < cd.len() {
+            let (name_b, entry, next_pos) = Self::parse_cd_entry_at(&cd, pos)?;
+            let name = std::str::from_utf8(name_b)?.to_string();
+            index.insert(name, entry);
+            pos = next_pos;
+        }
+        Ok(Self {
+            reader,
+            total_len,
+            index,
+        })
+    }
+
+    #[inline]
+    fn read_file(&self, path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let entry = self.index.get(path).ok_or("zip entry not found")?;
+        Self::read_and_decode_entry(&self.reader, self.total_len, entry)
+    }
+
+    /// Cold single-file read in exactly 3 `read_at` calls:
+    /// (1) 22B EOCD, (2) Central Directory slice scan (no HashMap allocation),
+    /// (3) 1 coalesced LFH + compressed payload read.
+    fn cold_read_single_file(
+        reader: &R,
+        target_path: &str,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let total_len = reader.total_len()?;
+        let (cd_off, cd_size) = Self::locate_cd(reader, total_len)?;
+        let target_b = target_path.as_bytes();
+        let entry = ZIP_IO_TLS.with(|cell| -> Result<ZipCdEntry, Box<dyn std::error::Error>> {
+            let mut cd = cell.borrow_mut();
+            if cd.len() < cd_size {
+                cd.resize(cd_size, 0);
+            }
+            reader.read_at(cd_off, &mut cd[..cd_size])?;
+            let cd_slice = &cd[..cd_size];
+            let mut pos = 0usize;
+            while pos < cd_slice.len() {
+                let (name_b, entry, next_pos) = Self::parse_cd_entry_at(cd_slice, pos)?;
+                if name_b == target_b {
+                    return Ok(entry);
+                }
+                pos = next_pos;
+            }
+            Err("target_path not found in zip central directory".into())
+        })?;
+        Self::read_and_decode_entry(reader, total_len, &entry)
+    }
+
+    /// Scans the Central Directory in 2 `read_at` calls (EOCD + CD) and counts entries matching `prefix`.
+    fn count_dir_prefix(reader: &R, prefix: &str) -> Result<usize, Box<dyn std::error::Error>> {
+        let total_len = reader.total_len()?;
+        let (cd_off, cd_size) = Self::locate_cd(reader, total_len)?;
+        let prefix_b = prefix.as_bytes();
+        ZIP_IO_TLS.with(|cell| -> Result<usize, Box<dyn std::error::Error>> {
+            let mut cd = cell.borrow_mut();
+            if cd.len() < cd_size {
+                cd.resize(cd_size, 0);
+            }
+            reader.read_at(cd_off, &mut cd[..cd_size])?;
+            let cd_slice = &cd[..cd_size];
+            let mut pos = 0usize;
+            let mut count = 0usize;
+            while pos < cd_slice.len() {
+                let (name_b, _, next_pos) = Self::parse_cd_entry_at(cd_slice, pos)?;
+                if name_b.starts_with(prefix_b) {
+                    count += 1;
+                }
+                pos = next_pos;
+            }
+            Ok(count)
+        })
+    }
+
+    /// Unpacks all entries directly from an in-memory ZIP slice without `ZipArchive::new` LFH seeks.
+    fn unpack_all_slice(archive: &[u8]) -> Result<u64, Box<dyn std::error::Error>> {
+        let total_len = archive.len() as u64;
+        let (cd_off, cd_size) = BestCaseZipReader::<&[u8]>::locate_cd(&archive, total_len)?;
+        let cd_start = cd_off as usize;
+        let cd_end = cd_start
+            .checked_add(cd_size)
+            .ok_or("zip cd overflow")?;
+        if cd_end > archive.len() {
+            return Err("zip cd out of bounds".into());
+        }
+        let cd_slice = &archive[cd_start..cd_end];
+        let mut pos = 0usize;
+        let mut total = 0u64;
+        while pos < cd_slice.len() {
+            let (_, entry, next_pos) = Self::parse_cd_entry_at(cd_slice, pos)?;
+            let bytes =
+                BestCaseZipReader::<&[u8]>::read_and_decode_entry(&archive, total_len, &entry)?;
+            total += bytes.len() as u64;
+            black_box(&bytes);
+            pos = next_pos;
+        }
+        Ok(total)
+    }
+
+    /// Locates `target_path` in 2 reads (EOCD + CD), reads the 30B LFH (1 read), and streams
+    /// 64 KiB compressed chunks from `data_offset` until `range_off..range_off + range_len` is decoded.
+    fn read_entry_range(
+        reader: &R,
+        target_path: &str,
+        range_off: u64,
+        range_len: usize,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        struct ZipStreamRangeReader<'a, R: RangeReader> {
+            reader: &'a R,
+            cur_off: u64,
+            end_off: u64,
+        }
+        impl<R: RangeReader> Read for ZipStreamRangeReader<'_, R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.cur_off >= self.end_off || buf.is_empty() {
+                    return Ok(0);
+                }
+                let avail = (self.end_off - self.cur_off) as usize;
+                let n = buf.len().min(avail).min(64 * 1024);
+                self.reader
+                    .read_at(self.cur_off, &mut buf[..n])
+                    .map_err(|_| std::io::Error::other("range read failed"))?;
+                self.cur_off += n as u64;
+                Ok(n)
+            }
+        }
+
+        let total_len = reader.total_len()?;
+        let (cd_off, cd_size) = Self::locate_cd(reader, total_len)?;
+        let mut cd = vec![0u8; cd_size];
+        reader.read_at(cd_off, &mut cd)?;
+        let target_b = target_path.as_bytes();
+        let mut found: Option<ZipCdEntry> = None;
+        let mut pos = 0usize;
+        while pos < cd.len() {
+            let (name_b, entry, next_pos) = Self::parse_cd_entry_at(&cd, pos)?;
+            if name_b == target_b {
+                found = Some(entry);
+                break;
+            }
+            pos = next_pos;
+        }
+        let entry = found.ok_or("zip entry not found")?;
+        let mut lfh = [0u8; 30];
+        reader.read_at(entry.lfh_offset, &mut lfh)?;
+        if lfh[0..4] != [0x50, 0x4b, 0x03, 0x04] {
+            return Err("bad zip LFH".into());
+        }
+        let nlen = u16::from_le_bytes([lfh[26], lfh[27]]) as u64;
+        let elen = u16::from_le_bytes([lfh[28], lfh[29]]) as u64;
+        let data_off = entry.lfh_offset + 30 + nlen + elen;
+        let data_end = data_off + entry.comp_size as u64;
+
+        let stream = ZipStreamRangeReader {
+            reader,
+            cur_off: data_off,
+            end_off: data_end,
+        };
+        let mut dec = zstd::stream::read::Decoder::new(BufReader::with_capacity(64 * 1024, stream))?;
+        std::io::copy(&mut dec.by_ref().take(range_off), &mut std::io::sink())?;
+        let mut out = vec![0u8; range_len];
+        dec.read_exact(&mut out)?;
+        Ok(out)
+    }
 }
 
 fn pack_format_to_vec(
@@ -187,9 +666,11 @@ fn pack_format_to_vec(
                 dict_id: if use_dict { Some(1) } else { None },
                 ..Default::default()
             };
-            for (path, data) in corpus {
-                w.add_file_with_options(path, data, opts.clone())?;
-            }
+            let batch: Vec<(&str, &[u8], &EntryOptions)> = corpus
+                .iter()
+                .map(|(p, d)| (p.as_str(), d.as_slice(), &opts))
+                .collect();
+            w.add_files_batch(&batch)?;
             Ok(w.finish()?.into_inner())
         }
         FormatKind::Tar => {
@@ -282,16 +763,7 @@ fn unpack_all_from_slice(
         FormatKind::TarLz4 => unpack_tar_stream(lz4_flex::frame::FrameDecoder::new(Cursor::new(archive))),
         FormatKind::TarZst => unpack_tar_stream(zstd::stream::Decoder::new(Cursor::new(archive))?),
         FormatKind::ZipStored | FormatKind::ZipDeflate | FormatKind::ZipZstd => {
-            let mut za = zip::ZipArchive::new(Cursor::new(archive))?;
-            let mut total = 0u64;
-            let mut buf = Vec::new();
-            for i in 0..za.len() {
-                let mut f = za.by_index(i)?;
-                buf.clear();
-                f.read_to_end(&mut buf)?;
-                total += buf.len() as u64;
-            }
-            Ok(total)
+            BestCaseZipReader::<&[u8]>::unpack_all_slice(archive)
         }
     }
 }
@@ -328,11 +800,7 @@ fn random_access_from_file(
             find_in_tar_stream(zstd::stream::Decoder::new(BufReader::new(file))?, target_path)
         }
         FormatKind::ZipStored | FormatKind::ZipDeflate | FormatKind::ZipZstd => {
-            let mut za = zip::ZipArchive::new(BufReader::new(file))?;
-            let mut f = za.by_name(target_path)?;
-            let mut buf = Vec::with_capacity(f.size() as usize);
-            f.read_to_end(&mut buf)?;
-            Ok(buf)
+            BestCaseZipReader::cold_read_single_file(&file, target_path)
         }
     }
 }
@@ -504,6 +972,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 assert_eq!(&got, target_expected);
                 (cnt.reads(), cnt.bytes_read())
             }
+            FormatKind::ZipStored | FormatKind::ZipDeflate | FormatKind::ZipZstd => {
+                let f_cnt = tf.reopen()?;
+                let cnt = CountingRangeReader::new(f_cnt);
+                let got = BestCaseZipReader::cold_read_single_file(&cnt, target_path)?;
+                assert_eq!(&got, target_expected);
+                (cnt.reads(), cnt.bytes_read())
+            }
             _ => {
                 let mut f_cnt = tf.reopen()?;
                 f_cnt.seek(SeekFrom::Start(0))?;
@@ -516,13 +991,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     FormatKind::TarZst => {
                         find_in_tar_stream(zstd::stream::Decoder::new(&mut crs)?, target_path)?
-                    }
-                    FormatKind::ZipStored | FormatKind::ZipDeflate | FormatKind::ZipZstd => {
-                        let mut za = zip::ZipArchive::new(BufReader::new(&mut crs))?;
-                        let mut zf = za.by_name(target_path)?;
-                        let mut b = Vec::new();
-                        zf.read_to_end(&mut b)?;
-                        b
                     }
                     _ => unreachable!(),
                 };
@@ -541,7 +1009,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Also measure VZ warm mmap lookup on that same archive
+    // Also measure warm mmap lookup on that same archive (VZ vs BestCaseZipReader)
     for (fmt, tf, _) in &mixed_files {
         if matches!(fmt, FormatKind::VzZstd | FormatKind::VzZstdDict) {
             let f_ro = tf.reopen()?;
@@ -550,6 +1018,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let t0 = Instant::now();
             for _ in 0..5_000 {
                 black_box(vr.read_file(target_path)?);
+            }
+            let us = t0.elapsed().as_secs_f64() * 1e6 / 5_000.0;
+            println!("  -> {} warm Mmap read_file: {us:.2} us/op", fmt.label());
+        } else if matches!(fmt, FormatKind::ZipZstd) {
+            let f_ro = tf.reopen()?;
+            let mmap = unsafe { MmapRangeReader::from_file(&f_ro) }?;
+            let zr = BestCaseZipReader::open(mmap)?;
+            let t0 = Instant::now();
+            for _ in 0..5_000 {
+                black_box(zr.read_file(target_path)?);
             }
             let us = t0.elapsed().as_secs_f64() * 1e6 / 5_000.0;
             println!("  -> {} warm Mmap read_file: {us:.2} us/op", fmt.label());
@@ -581,19 +1059,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             FormatKind::ZipZstd => {
+                let f_ro = tf.reopen()?;
                 let t0 = Instant::now();
-                for _ in 0..50 {
-                    let f_ro = tf.reopen()?;
-                    let za = zip::ZipArchive::new(BufReader::new(f_ro))?;
-                    let c = za
-                        .file_names()
-                        .filter(|n| n.starts_with("hot_dir/"))
-                        .count();
+                for _ in 0..200 {
+                    let c = BestCaseZipReader::count_dir_prefix(&f_ro, "hot_dir/")?;
                     assert_eq!(c, 2_000);
                 }
                 println!(
-                    "  ZIP (Zstd) file_names scan (File+Buf): {:>7.2} us",
-                    t0.elapsed().as_secs_f64() * 1e6 / 50.0
+                    "  ZIP (Zstd) CD scan (File pread):  {:>8.2} us",
+                    t0.elapsed().as_secs_f64() * 1e6 / 200.0
                 );
             }
             FormatKind::TarZst => {
@@ -914,77 +1388,6 @@ impl RangeReader for HttpRangeReader {
     }
 }
 
-struct HttpSeekableReader {
-    conn: BufReader<TcpStream>,
-    pos: u64,
-    total_len: u64,
-    reqs: usize,
-    bytes: u64,
-}
-
-impl HttpSeekableReader {
-    fn connect(addr: SocketAddr) -> std::io::Result<Self> {
-        let stream = TcpStream::connect(addr)?;
-        stream.set_nodelay(true)?;
-        let mut conn = BufReader::new(stream);
-        conn.get_mut().write_all(
-            b"HEAD /archive HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n",
-        )?;
-        conn.get_mut().flush()?;
-        let (_, total_len) = read_http_headers(&mut conn)?;
-        Ok(Self {
-            conn,
-            pos: 0,
-            total_len,
-            reqs: 1,
-            bytes: 0,
-        })
-    }
-}
-
-impl Read for HttpSeekableReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.pos >= self.total_len || buf.is_empty() {
-            return Ok(0);
-        }
-        let end = (self.pos + buf.len() as u64 - 1).min(self.total_len - 1);
-        let req = format!(
-            "GET /archive HTTP/1.1\r\nHost: localhost\r\nRange: bytes={}-{end}\r\nConnection: keep-alive\r\n\r\n",
-            self.pos
-        );
-        self.conn.get_mut().write_all(req.as_bytes())?;
-        self.conn.get_mut().flush()?;
-        let (status, clen) = read_http_headers(&mut self.conn)?;
-        if status != 206 && status != 200 {
-            return Err(std::io::Error::other("unexpected http status"));
-        }
-        let n = clen as usize;
-        self.conn.read_exact(&mut buf[..n])?;
-        self.pos += clen;
-        self.reqs += 1;
-        self.bytes += clen;
-        Ok(n)
-    }
-}
-
-impl Seek for HttpSeekableReader {
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        let next = match pos {
-            SeekFrom::Start(s) => s as i128,
-            SeekFrom::End(d) => self.total_len as i128 + d as i128,
-            SeekFrom::Current(d) => self.pos as i128 + d as i128,
-        };
-        if next < 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "negative seek",
-            ));
-        }
-        self.pos = next as u64;
-        Ok(self.pos)
-    }
-}
-
 struct HttpStreamResult {
     ms: f64,
     reqs: usize,
@@ -1062,8 +1465,10 @@ enum IopsTarget {
     VzLz4Mmap,
     VzZstdFile,
     VzZstdMmap,
-    ZipStored,
-    ZipZstd,
+    ZipStoredFile,
+    ZipStoredMmap,
+    ZipZstdFile,
+    ZipZstdMmap,
 }
 
 impl IopsTarget {
@@ -1075,8 +1480,10 @@ impl IopsTarget {
             Self::VzLz4Mmap => "VZ (LZ4, Mmap)",
             Self::VzZstdFile => "VZ (Zstd, File pread)",
             Self::VzZstdMmap => "VZ (Zstd, Mmap)",
-            Self::ZipStored => "ZIP (Stored, File)",
-            Self::ZipZstd => "ZIP (Zstd, File)",
+            Self::ZipStoredFile => "ZIP (Stored, File pread)",
+            Self::ZipStoredMmap => "ZIP (Stored, Mmap)",
+            Self::ZipZstdFile => "ZIP (Zstd, File pread)",
+            Self::ZipZstdMmap => "ZIP (Zstd, Mmap)",
         }
     }
 }
@@ -1092,7 +1499,7 @@ fn run_iops_bench(
     let file = File::open(path)?;
     let vz_file_reader = match target {
         IopsTarget::VzNoneFile | IopsTarget::VzLz4File | IopsTarget::VzZstdFile => {
-            // Single shared File handle: VZ uses stateless pread() across all threads with zero locks.
+            // Single shared File handle: stateless pread() across all threads with zero locks.
             Some(Arc::new(VzReader::open(file.try_clone()?)?))
         }
         _ => None,
@@ -1106,6 +1513,19 @@ fn run_iops_bench(
     } else {
         None
     };
+    let zip_file_reader = match target {
+        IopsTarget::ZipStoredFile | IopsTarget::ZipZstdFile => {
+            // Dedicated Best-Case ZIP Reader: single shared File handle with stateless pread() + TLS DCtx.
+            Some(Arc::new(BestCaseZipReader::open(file.try_clone()?)?))
+        }
+        _ => None,
+    };
+    let zip_mmap_reader = if matches!(target, IopsTarget::ZipStoredMmap | IopsTarget::ZipZstdMmap) {
+        let mmap = unsafe { MmapRangeReader::from_file(&file)? };
+        Some(Arc::new(BestCaseZipReader::open(mmap)?))
+    } else {
+        None
+    };
 
     let t0 = Instant::now();
     let all_latencies: Vec<Vec<u64>> = std::thread::scope(|s| {
@@ -1113,18 +1533,11 @@ fn run_iops_bench(
         for tid in 0..threads {
             let vz_f = vz_file_reader.as_ref().map(Arc::clone);
             let vz_m = vz_mmap_reader.as_ref().map(Arc::clone);
+            let zip_f = zip_file_reader.as_ref().map(Arc::clone);
+            let zip_m = zip_mmap_reader.as_ref().map(Arc::clone);
             handles.push(s.spawn(move || -> Vec<u64> {
                 let mut lats = Vec::with_capacity(ops_per_thread);
                 let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ ((tid as u64 + 1) * 0xBF58_476D_1CE4_E5B9);
-                let mut zip_ar = match target {
-                    IopsTarget::ZipStored | IopsTarget::ZipZstd => {
-                        // ZIP requires Seek+Read (not pread), so each thread must open an independent fd.
-                        let f_indep = File::open(path).expect("open zip per thread");
-                        Some(zip::ZipArchive::new(BufReader::new(f_indep)).expect("open zip"))
-                    }
-                    _ => None,
-                };
-                let mut scratch = Vec::with_capacity(16_384);
 
                 for _ in 0..ops_per_thread {
                     state ^= state << 13;
@@ -1140,11 +1553,12 @@ fn run_iops_bench(
                     } else if let Some(ref vm) = vz_m {
                         let d = vm.read_file(path).expect("vz mmap read");
                         black_box(d.len());
-                    } else if let Some(ref mut za) = zip_ar {
-                        scratch.clear();
-                        let mut zf = za.by_name(path).expect("zip by_name");
-                        zf.read_to_end(&mut scratch).expect("zip read");
-                        black_box(scratch.len());
+                    } else if let Some(ref zf) = zip_f {
+                        let d = zf.read_file(path).expect("zip pread");
+                        black_box(d.len());
+                    } else if let Some(ref zm) = zip_m {
+                        let d = zm.read_file(path).expect("zip mmap read");
+                        black_box(d.len());
                     }
                     lats.push(op0.elapsed().as_nanos() as u64);
                 }
@@ -1180,7 +1594,7 @@ fn run_extended_benchmarks(
         target_path,
         target_expected.len()
     );
-    println!("    Keep-alive TCP loopback with TCP_NODELAY; BufReader<64KiB> for ZIP; streaming GET for TAR");
+    println!("    Keep-alive TCP loopback with TCP_NODELAY; HttpRangeReader for VZ & BestCaseZip; streaming GET for TAR");
     println!(
         "{:<16} | {:>10} | {:>12} | {:>9} | {:>10}",
         "Format", "HTTP Req", "Transferred", "0ms (ms)", "2ms RTT (ms)"
@@ -1209,16 +1623,11 @@ fn run_extended_benchmarks(
             (ms, vr.reader().reqs(), vr.reader().bytes_read())
         } else if is_zip {
             let t0 = Instant::now();
-            let hs = HttpSeekableReader::connect(srv.addr)?;
-            let mut br = BufReader::with_capacity(64 * 1024, hs);
-            let mut za = zip::ZipArchive::new(&mut br)?;
-            let mut got = Vec::new();
-            za.by_name(target_path)?.read_to_end(&mut got)?;
+            let hr = HttpRangeReader::connect(srv.addr)?;
+            let got = BestCaseZipReader::cold_read_single_file(&hr, target_path)?;
             assert_eq!(&got, target_expected);
-            drop(za);
-            let hs_back = br.into_inner();
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
-            (ms, hs_back.reqs, hs_back.bytes)
+            (ms, hr.reqs(), hr.bytes_read())
         } else {
             let res = http_stream_tar_lookup(srv.addr, is_tar_zst, target_path)?;
             assert_eq!(&res.data, target_expected);
@@ -1235,11 +1644,8 @@ fn run_extended_benchmarks(
             t0.elapsed().as_secs_f64() * 1000.0
         } else if is_zip {
             let t0 = Instant::now();
-            let hs = HttpSeekableReader::connect(srv.addr)?;
-            let mut br = BufReader::with_capacity(64 * 1024, hs);
-            let mut za = zip::ZipArchive::new(&mut br)?;
-            let mut got = Vec::new();
-            za.by_name(target_path)?.read_to_end(&mut got)?;
+            let hr = HttpRangeReader::connect(srv.addr)?;
+            let got = BestCaseZipReader::cold_read_single_file(&hr, target_path)?;
             assert_eq!(&got, target_expected);
             t0.elapsed().as_secs_f64() * 1000.0
         } else {
@@ -1292,24 +1698,26 @@ fn run_extended_benchmarks(
         (IopsTarget::VzLz4Mmap, &f_vz_lz4),
         (IopsTarget::VzZstdFile, &f_vz_zstd),
         (IopsTarget::VzZstdMmap, &f_vz_zstd),
-        (IopsTarget::ZipStored, &f_zip_stored),
-        (IopsTarget::ZipZstd, &f_zip_zstd),
+        (IopsTarget::ZipStoredFile, &f_zip_stored),
+        (IopsTarget::ZipStoredMmap, &f_zip_stored),
+        (IopsTarget::ZipZstdFile, &f_zip_zstd),
+        (IopsTarget::ZipZstdMmap, &f_zip_zstd),
     ];
 
     if max_threads > 6 {
         let max_col = format!("{max_threads}T IOPS");
         println!(
-            "{:<22} | {:>11} | {:>7} | {:>7} | {:>11} | {:>7} | {:>7} | {:>11} | {:>7} | {:>7} | {:>7}",
+            "{:<24} | {:>11} | {:>7} | {:>7} | {:>11} | {:>7} | {:>7} | {:>11} | {:>7} | {:>7} | {:>7}",
             "Format", "1T IOPS", "p50 us", "p99 us", "6T IOPS", "p50 us", "p99 us", max_col, "p50 us", "p99 us", "Scale"
         );
-        println!("{}", "-".repeat(126));
+        println!("{}", "-".repeat(128));
         for (target, tf) in iops_targets {
             let (iops1, p50_1, p99_1) = run_iops_bench(target, tf.path(), &paths_20k, 1, 10_000)?;
             let (iops6, p50_6, p99_6) = run_iops_bench(target, tf.path(), &paths_20k, 6, 30_000)?;
             let (iopsm, p50_m, p99_m) =
                 run_iops_bench(target, tf.path(), &paths_20k, max_threads, max_ops)?;
             println!(
-                "{:<22} | {:>11.0} | {:>7.2} | {:>7.2} | {:>11.0} | {:>7.2} | {:>7.2} | {:>11.0} | {:>7.2} | {:>7.2} | {:>6.2}x",
+                "{:<24} | {:>11.0} | {:>7.2} | {:>7.2} | {:>11.0} | {:>7.2} | {:>7.2} | {:>11.0} | {:>7.2} | {:>7.2} | {:>6.2}x",
                 target.label(),
                 iops1, p50_1, p99_1,
                 iops6, p50_6, p99_6,
@@ -1322,16 +1730,16 @@ fn run_extended_benchmarks(
         let par_ops = if par_threads == 6 { 30_000 } else { max_ops };
         let par_col = format!("{par_threads}T IOPS");
         println!(
-            "{:<22} | {:>11} | {:>7} | {:>7} | {:>11} | {:>7} | {:>7} | {:>7}",
+            "{:<24} | {:>11} | {:>7} | {:>7} | {:>11} | {:>7} | {:>7} | {:>7}",
             "Format", "1T IOPS", "p50 us", "p99 us", par_col, "p50 us", "p99 us", "Scale"
         );
-        println!("{}", "-".repeat(96));
+        println!("{}", "-".repeat(98));
         for (target, tf) in iops_targets {
             let (iops1, p50_1, p99_1) = run_iops_bench(target, tf.path(), &paths_20k, 1, 10_000)?;
             let (iopsp, p50_p, p99_p) =
                 run_iops_bench(target, tf.path(), &paths_20k, par_threads, par_ops)?;
             println!(
-                "{:<22} | {:>11.0} | {:>7.2} | {:>7.2} | {:>11.0} | {:>7.2} | {:>7.2} | {:>6.2}x",
+                "{:<24} | {:>11.0} | {:>7.2} | {:>7.2} | {:>11.0} | {:>7.2} | {:>7.2} | {:>6.2}x",
                 target.label(),
                 iops1, p50_1, p99_1,
                 iopsp, p50_p, p99_p,
@@ -1340,14 +1748,14 @@ fn run_extended_benchmarks(
         }
     } else {
         println!(
-            "{:<22} | {:>11} | {:>7} | {:>7}",
+            "{:<24} | {:>11} | {:>7} | {:>7}",
             "Format", "1T IOPS", "p50 us", "p99 us"
         );
-        println!("{}", "-".repeat(56));
+        println!("{}", "-".repeat(58));
         for (target, tf) in iops_targets {
             let (iops1, p50_1, p99_1) = run_iops_bench(target, tf.path(), &paths_20k, 1, 10_000)?;
             println!(
-                "{:<22} | {:>11.0} | {:>7.2} | {:>7.2}",
+                "{:<24} | {:>11.0} | {:>7.2} | {:>7.2}",
                 target.label(),
                 iops1,
                 p50_1,
@@ -1371,7 +1779,7 @@ fn run_extended_benchmarks(
         lats.sort_unstable();
         if max_threads > 6 {
             println!(
-                "{:<22} | {:>11.1} | {:>7.0} | {:>7.0} | {:>11} | {:>7} | {:>7} | {:>11} | {:>7} | {:>7} | {:>7}",
+                "{:<24} | {:>11.1} | {:>7.0} | {:>7.0} | {:>11} | {:>7} | {:>7} | {:>11} | {:>7} | {:>7} | {:>7}",
                 "TAR.ZST (10-op sample)",
                 10.0 / dt,
                 percentile_us(&lats, 0.50),
@@ -1380,7 +1788,7 @@ fn run_extended_benchmarks(
             );
         } else if max_threads > 1 {
             println!(
-                "{:<22} | {:>11.1} | {:>7.0} | {:>7.0} | {:>11} | {:>7} | {:>7} | {:>7}",
+                "{:<24} | {:>11.1} | {:>7.0} | {:>7.0} | {:>11} | {:>7} | {:>7} | {:>7}",
                 "TAR.ZST (10-op sample)",
                 10.0 / dt,
                 percentile_us(&lats, 0.50),
@@ -1389,7 +1797,7 @@ fn run_extended_benchmarks(
             );
         } else {
             println!(
-                "{:<22} | {:>11.1} | {:>7.0} | {:>7.0}",
+                "{:<24} | {:>11.1} | {:>7.0} | {:>7.0}",
                 "TAR.ZST (10-op sample)",
                 10.0 / dt,
                 percentile_us(&lats, 0.50),
@@ -1444,17 +1852,13 @@ fn run_extended_benchmarks(
         let mut t_sum = 0.0;
         let mut bytes_read = 0u64;
         for _ in 0..5 {
-            let cs = CountingReadSeek::new(Cursor::new(zip_big.as_slice()));
+            let cnt = CountingRangeReader::new(zip_big.as_slice());
             let t0 = Instant::now();
-            let mut za = zip::ZipArchive::new(cs)?;
-            let mut zf = za.by_name("big_blob.bin")?;
-            std::io::copy(&mut zf.by_ref().take(range_off), &mut std::io::sink())?;
-            let mut got = vec![0u8; range_len];
-            zf.read_exact(&mut got)?;
+            let got =
+                BestCaseZipReader::read_entry_range(&cnt, "big_blob.bin", range_off, range_len)?;
             t_sum += t0.elapsed().as_secs_f64() * 1000.0;
             assert_eq!(got.as_slice(), expected_slice);
-            drop(zf);
-            bytes_read = za.into_inner().bytes_read();
+            bytes_read = cnt.bytes_read();
         }
         println!(
             "{:<18} | {:>7.2} ms | {:>10.1} KB | Decompresses from byte 0..24.06 MiB",
@@ -1811,17 +2215,11 @@ fn run_extended_benchmarks(
         }
         let vz_lu_ns = t_lu.elapsed().as_secs_f64() * 1e9 / 10_000.0;
 
-        // Compare ZIP & TAR.ZST cold directory stat+list of `hot_dir/` from disk
+        // Compare ZIP (BestCaseZipReader 2-read CD scan) & TAR.ZST cold directory stat+list of `hot_dir/` from disk
         let zip_tf = write_temp_file(&base_zip)?;
+        let zip_ro = zip_tf.reopen()?;
         let t_zmeta = Instant::now();
-        let mut zf = zip::ZipArchive::new(BufReader::new(zip_tf.reopen()?))?;
-        let mut z_cnt = 0usize;
-        for idx in 0..zf.len() {
-            let entry = zf.by_index_raw(idx)?;
-            if entry.name().starts_with("hot_dir/") {
-                z_cnt += 1;
-            }
-        }
+        let z_cnt = BestCaseZipReader::count_dir_prefix(&zip_ro, "hot_dir/")?;
         assert_eq!(z_cnt, 2000);
         let zip_meta_us = t_zmeta.elapsed().as_secs_f64() * 1e6;
 
@@ -1918,22 +2316,16 @@ fn run_extended_benchmarks(
         let vz_4k_reads = fs_n.reader().reader().reads();
         let vz_4k_bytes = fs_n.reader().reader().bytes_read();
 
-        // ZIP (Zstd): open entry + discard 1 MiB + read 64 x 4 KiB (256 KiB)
-        let crs_zip = CountingReadSeek::new(Cursor::new(blob_zip_z.as_slice()));
+        // ZIP (Zstd, BestCaseZipReader): locate entry in 2 reads + LFH + discard 1 MiB + read 256 KiB
+        let cnt_zip = CountingRangeReader::new(blob_zip_z.as_slice());
         let t_zip_seq = Instant::now();
-        let mut z_arch = zip::ZipArchive::new(BufReader::with_capacity(64 * 1024, crs_zip))?;
-        let mut z_ent = z_arch.by_name("blob.bin")?;
-        std::io::copy(&mut z_ent.by_ref().take(1024 * 1024), &mut std::io::sink())?;
-        let mut page = [0u8; 4096];
-        for _ in 0..64 {
-            z_ent.read_exact(&mut page)?;
-            black_box(page[0]);
-        }
-        drop(z_ent);
-        let crs_zip_inner = z_arch.into_inner().into_inner();
+        let got_zip =
+            BestCaseZipReader::read_entry_range(&cnt_zip, "blob.bin", 1024 * 1024, 64 * 4096)?;
+        black_box(got_zip.len());
         let dt_zip_seq = t_zip_seq.elapsed().as_secs_f64() * 1e6;
 
         // TAR.ZST: decompress stream to 1 MiB + read 64 x 4 KiB
+        let mut page = [0u8; 4096];
         let crs_tar = CountingReadSeek::new(Cursor::new(blob_tar_z.as_slice()));
         let t_tar_seq = Instant::now();
         let mut tar_dec = zstd::stream::read::Decoder::new(BufReader::with_capacity(64 * 1024, crs_tar))?;
@@ -1964,8 +2356,8 @@ fn run_extended_benchmarks(
         println!(
             "  ZIP (Zstd stream skip) : {:>8.2} us | reads = {:>2} | bytes = {:>7} B",
             dt_zip_seq,
-            crs_zip_inner.reads(),
-            crs_zip_inner.bytes_read()
+            cnt_zip.reads(),
+            cnt_zip.bytes_read()
         );
         println!(
             "  TAR.ZST (stream skip)  : {:>8.2} us | reads = {:>2} | bytes = {:>7} B",

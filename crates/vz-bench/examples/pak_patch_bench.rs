@@ -179,6 +179,52 @@ impl BatchBlobReader {
         self.stdout.read_exact(&mut nl)?;
         Ok(())
     }
+
+    /// Pipelined batch fetch for an arbitrary slice of SHAs: streams in 64-SHA pipe windows
+    /// (1 flush per 64 SHAs so pipe buffers never deadlock) into `arena` and `ranges`.
+    fn read_blobs_pipelined(
+        &mut self,
+        shas: &[&str],
+        arena: &mut Vec<u8>,
+        ranges: &mut Vec<(usize, usize)>,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        arena.clear();
+        ranges.clear();
+        let mut total_bytes = 0u64;
+        for sub in shas.chunks(64) {
+            for &sha in sub {
+                self.stdin.write_all(sha.as_bytes())?;
+                self.stdin.write_all(b"\n")?;
+            }
+            self.stdin.flush()?;
+
+            for _ in 0..sub.len() {
+                self.header_line.clear();
+                let n = self.stdout.read_line(&mut self.header_line)?;
+                if n == 0 {
+                    return Err("unexpected EOF from git cat-file --batch".into());
+                }
+                let parts: Vec<&str> = self.header_line.split_whitespace().collect();
+                if parts.len() < 3 || parts[1] != "blob" {
+                    return Err(format!(
+                        "unexpected git cat-file header: {}",
+                        self.header_line.trim()
+                    )
+                    .into());
+                }
+                let size: usize = parts[2].parse()?;
+                let start = arena.len();
+                let end = start + size;
+                arena.resize(end, 0);
+                self.stdout.read_exact(&mut arena[start..end])?;
+                let mut nl = [0u8; 1];
+                self.stdout.read_exact(&mut nl)?;
+                ranges.push((start, end));
+                total_bytes += size as u64;
+            }
+        }
+        Ok(total_bytes)
+    }
 }
 
 impl Drop for BatchBlobReader {
@@ -432,23 +478,36 @@ fn build_base_pak(
     let t0 = Instant::now();
     let mut known_dirs: HashSet<String> = HashSet::new();
     let mut staging_dirs: HashSet<String> = HashSet::new();
-    let mut blob = Vec::with_capacity(64 * 1024);
+    let mut arena = Vec::with_capacity(16 * 1024 * 1024);
+    let mut ranges = Vec::with_capacity(1024);
+    let mut shas_buf = Vec::with_capacity(1024);
+    let mut opts_vec = Vec::with_capacity(1024);
     let mut raw_bytes = 0u64;
 
-    for e in &entries {
-        emit_missing_ancestors(&e.path, &mut known_dirs, &mut staging_dirs, |dir| {
-            writer.add_dir(dir, 0o755, 0)
-        })?;
-        for d in staging_dirs.drain() {
-            known_dirs.insert(d);
+    for chunk in entries.chunks(1024) {
+        for e in chunk {
+            emit_missing_ancestors(&e.path, &mut known_dirs, &mut staging_dirs, |dir| {
+                writer.add_dir(dir, 0o755, 0)
+            })?;
+            for d in staging_dirs.drain() {
+                known_dirs.insert(d);
+            }
         }
-        batch.read_blob_into(&e.sha, &mut blob)?;
-        raw_bytes += blob.len() as u64;
-        writer.add_file_with_options(
-            &e.path,
-            &blob,
-            entry_options_for_git_mode(e.mode, codec),
-        )?;
+        shas_buf.clear();
+        for e in chunk {
+            shas_buf.push(e.sha.as_str());
+        }
+        raw_bytes += batch.read_blobs_pipelined(&shas_buf, &mut arena, &mut ranges)?;
+        opts_vec.clear();
+        for e in chunk {
+            opts_vec.push(entry_options_for_git_mode(e.mode, codec));
+        }
+        let mut batch_refs = Vec::with_capacity(chunk.len());
+        for (i, e) in chunk.iter().enumerate() {
+            let (s, end) = ranges[i];
+            batch_refs.push((e.path.as_str(), &arena[s..end], &opts_vec[i]));
+        }
+        writer.add_files_batch(&batch_refs)?;
     }
 
     let bw_done = writer.finish()?;
@@ -522,11 +581,11 @@ fn apply_git_delta(
 
     let t0 = Instant::now();
     let mut delta_dirs: HashSet<String> = HashSet::new();
-    let mut blob = Vec::with_capacity(64 * 1024);
     let mut adds = 0usize;
     let mut mods = 0usize;
     let mut dels = 0usize;
     let mut raw_changed_bytes = 0u64;
+    let mut live_diffs: Vec<&GitDiffEntry> = Vec::with_capacity(diffs.len());
 
     for d in &diffs {
         match d.kind {
@@ -540,20 +599,36 @@ fn apply_git_delta(
                 emit_missing_ancestors(&d.path, known_dirs, &mut delta_dirs, |dir| {
                     app.add_dir(dir, 0o755, 0)
                 })?;
-                batch.read_blob_into(&d.new_sha, &mut blob)?;
-                raw_changed_bytes += blob.len() as u64;
-                app.add_file_with_options(
-                    &d.path,
-                    &blob,
-                    entry_options_for_git_mode(d.new_mode, codec),
-                )?;
                 if matches!(d.kind, GitDiffKind::Add) {
                     adds += 1;
                 } else {
                     mods += 1;
                 }
+                live_diffs.push(d);
             }
         }
+    }
+
+    let mut arena = Vec::with_capacity(16 * 1024 * 1024);
+    let mut ranges = Vec::with_capacity(1024);
+    let mut shas_buf = Vec::with_capacity(1024);
+    let mut opts_vec = Vec::with_capacity(1024);
+    for chunk in live_diffs.chunks(1024) {
+        shas_buf.clear();
+        for d in chunk {
+            shas_buf.push(d.new_sha.as_str());
+        }
+        raw_changed_bytes += batch.read_blobs_pipelined(&shas_buf, &mut arena, &mut ranges)?;
+        opts_vec.clear();
+        for d in chunk {
+            opts_vec.push(entry_options_for_git_mode(d.new_mode, codec));
+        }
+        let mut batch_refs = Vec::with_capacity(chunk.len());
+        for (i, d) in chunk.iter().enumerate() {
+            let (s, end) = ranges[i];
+            batch_refs.push((d.path.as_str(), &arena[s..end], &opts_vec[i]));
+        }
+        app.add_files_batch(&batch_refs)?;
     }
 
     let mut f_done = app.finish()?;
@@ -622,6 +697,9 @@ struct IopsReport {
     iops_6t: f64,
     p50_6t_us: f64,
     p99_6t_us: f64,
+    iops_maxt: f64,
+    p50_maxt_us: f64,
+    p99_maxt_us: f64,
 }
 
 fn bench_random_read_iops(
@@ -651,36 +729,48 @@ fn bench_random_read_iops(
     let dt1 = t1_all.elapsed().as_secs_f64();
     lats_1t.sort_unstable();
 
-    // 6T concurrent read IOPS sharing the single Arc<VzReader<MmapRangeReader>>
     let shared_paths = Arc::new(live_paths.to_vec());
-    let threads = 6usize;
-    let t6_all = Instant::now();
-    let mut handles = Vec::with_capacity(threads);
-    for tid in 0..threads {
-        let r = Arc::clone(&reader);
-        let ps = Arc::clone(&shared_paths);
-        handles.push(std::thread::spawn(move || -> Result<Vec<u64>, VzError> {
-            let mut local_lats = Vec::with_capacity(ops_per_thread);
-            let mut s = 0xD1B5_4A32_D192_ED03u64 ^ ((tid as u64 + 1) * 0x94D0_49BB_1331_11EB);
-            let len = ps.len();
-            for _ in 0..ops_per_thread {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
-                let p = &ps[(s as usize) % len];
-                let ts = Instant::now();
-                let data = r.read_file(p)?;
-                black_box(data.len());
-                local_lats.push(ts.elapsed().as_nanos() as u64);
-            }
-            Ok(local_lats)
-        }));
-    }
-    let mut all_lats_6t = Vec::with_capacity(threads * ops_per_thread);
-    for h in handles {
-        let res = h.join().map_err(|_| "worker panicked")??;
-        all_lats_6t.extend(res);
-    }
-    let dt6 = t6_all.elapsed().as_secs_f64();
-    all_lats_6t.sort_unstable();
+    let run_par = |threads: usize| -> Result<(f64, Vec<u64>), Box<dyn std::error::Error>> {
+        let t_all = Instant::now();
+        let mut handles = Vec::with_capacity(threads);
+        for tid in 0..threads {
+            let r = Arc::clone(&reader);
+            let ps = Arc::clone(&shared_paths);
+            handles.push(std::thread::spawn(move || -> Result<Vec<u64>, VzError> {
+                let mut local_lats = Vec::with_capacity(ops_per_thread);
+                let mut s = 0xD1B5_4A32_D192_ED03u64 ^ ((tid as u64 + 1) * 0x94D0_49BB_1331_11EB);
+                let len = ps.len();
+                for _ in 0..ops_per_thread {
+                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let p = &ps[(s as usize) % len];
+                    let ts = Instant::now();
+                    let data = r.read_file(p)?;
+                    black_box(data.len());
+                    local_lats.push(ts.elapsed().as_nanos() as u64);
+                }
+                Ok(local_lats)
+            }));
+        }
+        let mut all_lats = Vec::with_capacity(threads * ops_per_thread);
+        for h in handles {
+            let res = h.join().map_err(|_| "worker panicked")??;
+            all_lats.extend(res);
+        }
+        let dt = t_all.elapsed().as_secs_f64();
+        all_lats.sort_unstable();
+        Ok(((threads * ops_per_thread) as f64 / dt, all_lats))
+    };
+
+    let (iops_6t, all_lats_6t) = run_par(6)?;
+    let max_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(6)
+        .max(6);
+    let (iops_maxt, all_lats_maxt) = if max_threads > 6 {
+        run_par(max_threads)?
+    } else {
+        (iops_6t, all_lats_6t.clone())
+    };
 
     let pct = |sorted: &[u64], num: usize, den: usize| -> f64 {
         let idx = ((sorted.len() - 1) * num) / den;
@@ -691,9 +781,12 @@ fn bench_random_read_iops(
         iops_1t: ops_per_thread as f64 / dt1,
         p50_1t_us: pct(&lats_1t, 50, 100),
         p99_1t_us: pct(&lats_1t, 99, 100),
-        iops_6t: (threads * ops_per_thread) as f64 / dt6,
+        iops_6t,
         p50_6t_us: pct(&all_lats_6t, 50, 100),
         p99_6t_us: pct(&all_lats_6t, 99, 100),
+        iops_maxt,
+        p50_maxt_us: pct(&all_lats_maxt, 50, 100),
+        p99_maxt_us: pct(&all_lats_maxt, 99, 100),
     })
 }
 
@@ -841,8 +934,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wd = work.path();
     let t0_tag = tags.hotfix_chain[0].as_str();
     let t4_tag = tags.hotfix_chain[4].as_str();
+    let max_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(6)
+        .max(6);
     println!("=== VZ Real-World Game .pak Replacement Benchmark (Linux Kernel Corpus) ===");
-    println!("Repo: {} | Workdir: {}", cli.repo.display(), wd.display());
+    #[cfg(feature = "mimalloc")]
+    println!("Repo: {} | Workdir: {} | allocator: mimalloc | threads: {max_threads}", cli.repo.display(), wd.display());
+    #[cfg(not(feature = "mimalloc"))]
+    println!("Repo: {} | Workdir: {} | allocator: system | threads: {max_threads}", cli.repo.display(), wd.display());
     println!(
         "Tag Plan: Tier 1 ({}->{}) | Tier 2 ({}->{}) | Tier 3 ({}->{})",
         t0_tag, t4_tag, tags.season_old, tags.season_new, tags.expan_old, tags.expan_new
@@ -1054,18 +1154,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sz_reenc as f64 / (1024.0 * 1024.0)
     );
     println!();
+    let max_col = format!("{max_threads}T IOPS");
+    let max_p50_col = format!("{max_threads}T p50");
+    let max_p99_col = format!("{max_threads}T p99");
     println!(
-        "{:<38} | {:>10} | {:>7} | {:>7} | {:>10} | {:>7} | {:>7}",
-        "Random-Read Container State", "1T IOPS", "1T p50", "1T p99", "6T IOPS", "6T p50", "6T p99"
+        "{:<38} | {:>10} | {:>7} | {:>7} | {:>10} | {:>7} | {:>7} | {:>10} | {:>7} | {:>7}",
+        "Random-Read Container State",
+        "1T IOPS",
+        "1T p50",
+        "1T p99",
+        "6T IOPS",
+        "6T p50",
+        "6T p99",
+        max_col,
+        max_p50_col,
+        max_p99_col
     );
-    println!("{}", "-".repeat(102));
+    println!("{}", "-".repeat(134));
     let s1 = format!("Stacked Hotfix (5 runs, {t4_tag})");
     let s2 = format!("Expansion Delta (2 runs, {}->{})", tags.expan_old, tags.expan_new);
     let s3 = format!("Compacted Single-Run ({})", tags.expan_new);
     for (label, rep) in [(&s1, &iops_stack), (&s2, &iops_exp), (&s3, &iops_comp)] {
         println!(
-            "{:<38} | {:>10.0} | {:>5.2}us | {:>5.2}us | {:>10.0} | {:>5.2}us | {:>5.2}us",
-            label, rep.iops_1t, rep.p50_1t_us, rep.p99_1t_us, rep.iops_6t, rep.p50_6t_us, rep.p99_6t_us
+            "{:<38} | {:>10.0} | {:>5.2}us | {:>5.2}us | {:>10.0} | {:>5.2}us | {:>5.2}us | {:>10.0} | {:>5.2}us | {:>5.2}us",
+            label,
+            rep.iops_1t,
+            rep.p50_1t_us,
+            rep.p99_1t_us,
+            rep.iops_6t,
+            rep.p50_6t_us,
+            rep.p99_6t_us,
+            rep.iops_maxt,
+            rep.p50_maxt_us,
+            rep.p99_maxt_us
         );
     }
 
@@ -1078,7 +1199,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pak_path = wd.join("hotfix-base.pak");
     let (pak_build_ms, pak_base_bytes) = {
         let mut batch = BatchBlobReader::spawn(&cli.repo)?;
-        let mut blob = Vec::with_capacity(64 * 1024);
+        let mut arena = Vec::with_capacity(16 * 1024 * 1024);
+        let mut ranges = Vec::with_capacity(1024);
+        let mut shas_buf = Vec::with_capacity(1024);
 
         let mut zw = zip::ZipWriter::new(BufWriter::with_capacity(512 * 1024, File::create(&zip_path)?));
         let zopts = SimpleFileOptions::default().compression_method(CompressionMethod::Zstd);
@@ -1089,16 +1212,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         let mut tb = tar::Builder::new(zenc);
 
-        for e in &base_hot.entries {
-            batch.read_blob_into(&e.sha, &mut blob)?;
-            zw.start_file(&e.path, zopts)?;
-            zw.write_all(&blob)?;
+        for chunk in base_hot.entries.chunks(1024) {
+            shas_buf.clear();
+            for e in chunk {
+                shas_buf.push(e.sha.as_str());
+            }
+            batch.read_blobs_pipelined(&shas_buf, &mut arena, &mut ranges)?;
+            for (i, e) in chunk.iter().enumerate() {
+                let (s, end) = ranges[i];
+                let blob = &arena[s..end];
+                zw.start_file(&e.path, zopts)?;
+                zw.write_all(blob)?;
 
-            let mut hdr = tar::Header::new_gnu();
-            hdr.set_size(blob.len() as u64);
-            hdr.set_mode(e.mode & 0o777);
-            hdr.set_cksum();
-            tb.append_data(&mut hdr, &e.path, blob.as_slice())?;
+                let mut hdr = tar::Header::new_gnu();
+                hdr.set_size(blob.len() as u64);
+                hdr.set_mode(e.mode & 0o777);
+                hdr.set_cksum();
+                tb.append_data(&mut hdr, &e.path, blob)?;
+            }
         }
         zw.finish()?.into_inner()?.flush()?;
         tb.finish()?;
@@ -1114,9 +1245,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "../../../".to_string(),
                 None,
             );
-        for e in &base_hot.entries {
-            batch.read_blob_into(&e.sha, &mut blob)?;
-            pw.write_file(&e.path, true, &blob)?;
+        for chunk in base_hot.entries.chunks(1024) {
+            shas_buf.clear();
+            for e in chunk {
+                shas_buf.push(e.sha.as_str());
+            }
+            batch.read_blobs_pipelined(&shas_buf, &mut arena, &mut ranges)?;
+            for (i, e) in chunk.iter().enumerate() {
+                let (s, end) = ranges[i];
+                pw.write_file(&e.path, true, &arena[s..end])?;
+            }
         }
         let mut pw_inner = pw.write_index()?.into_inner()?;
         pw_inner.flush()?;
@@ -1125,7 +1263,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (pak_build_ms, pak_base_bytes)
     };
 
-    // D.1 Base Pack + Cold Open + Single File Read + 6T Random IOPS: VZ vs Unreal .pak (repak)
+    // D.1 Base Pack + Cold Open + Single File Read + 6T / MaxT Random IOPS: VZ vs Unreal .pak (repak)
     let probe_path = &base_hot.entries[(base_hot.entries.len() * 7) / 10].path;
     let vz_bytes_all = fs::read(&base_hot.pak_path)?;
     let t_vz_cold = Instant::now();
@@ -1145,12 +1283,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(vz_got, pak_got);
     let pak_crs_inner = pak_crs.into_inner();
 
-    // Compare 6T warm random read IOPS (shared VzReader<File> vs per-thread File repak::PakReader)
+    // Compare 6T & MaxT warm random read IOPS (shared VzReader<File> vs per-thread File repak::PakReader)
     let vz_base_file = Arc::new(VzReader::open(File::open(&base_hot.pak_path)?)?);
     let live_base_paths: Arc<Vec<String>> =
         Arc::new(base_hot.entries.iter().map(|e| e.path.clone()).collect());
-    let vz_file_6t_iops = {
-        let threads = 6usize;
+    let run_vz_file_iops = |threads: usize| -> Result<f64, Box<dyn std::error::Error>> {
         let ops = cli.ops_per_thread;
         let t0 = Instant::now();
         let mut hs = Vec::with_capacity(threads);
@@ -1170,12 +1307,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for h in hs {
             h.join().map_err(|_| "worker panicked")??;
         }
-        (threads * ops) as f64 / t0.elapsed().as_secs_f64()
+        Ok((threads * ops) as f64 / t0.elapsed().as_secs_f64())
+    };
+    let vz_file_6t_iops = run_vz_file_iops(6)?;
+    let vz_file_maxt_iops = if max_threads > 6 {
+        run_vz_file_iops(max_threads)?
+    } else {
+        vz_file_6t_iops
     };
 
     let pak_shared = Arc::new(pak_cold_r);
-    let pak_6t_iops = {
-        let threads = 6usize;
+    let run_pak_file_iops = |threads: usize| -> Result<f64, Box<dyn std::error::Error>> {
         let ops = cli.ops_per_thread;
         let t0 = Instant::now();
         let mut hs = Vec::with_capacity(threads);
@@ -1201,7 +1343,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for h in hs {
             h.join().map_err(|_| "worker panicked")??;
         }
-        (threads * ops) as f64 / t0.elapsed().as_secs_f64()
+        Ok((threads * ops) as f64 / t0.elapsed().as_secs_f64())
+    };
+    let pak_6t_iops = run_pak_file_iops(6)?;
+    let pak_maxt_iops = if max_threads > 6 {
+        run_pak_file_iops(max_threads)?
+    } else {
+        pak_6t_iops
     };
     drop(pak_shared);
     drop(vz_base_file);
@@ -1212,27 +1360,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         base_hot.entries.len()
     );
     println!(
-        "  {:<26} | {:>9} | {:>9} | {:>12} | {:>11} | {:>9}",
-        "Format", "Size MiB", "Pack ms", "Cold+1Read", "Cold Bytes", "6T IOPS"
+        "  {:<26} | {:>9} | {:>9} | {:>12} | {:>11} | {:>9} | {:>9}",
+        "Format", "Size MiB", "Pack ms", "Cold+1Read", "Cold Bytes", "6T IOPS", max_col
     );
-    println!("  {}", "-".repeat(90));
+    println!("  {}", "-".repeat(102));
     println!(
-        "  {:<26} | {:>9.2} | {:>9.2} | {:>9.2} us | {:>8} B | {:>9.0}",
+        "  {:<26} | {:>9.2} | {:>9.2} | {:>9.2} us | {:>8} B | {:>9.0} | {:>9.0}",
         "VZ (Zstd 256K cluster)",
         base_hot.archive_bytes as f64 / (1024.0 * 1024.0),
         base_hot.build_ms,
         vz_cold_us,
         vz_cold_bytes,
-        vz_file_6t_iops
+        vz_file_6t_iops,
+        vz_file_maxt_iops
     );
     println!(
-        "  {:<26} | {:>9.2} | {:>9.2} | {:>9.2} us | {:>8} B | {:>9.0}",
+        "  {:<26} | {:>9.2} | {:>9.2} | {:>9.2} us | {:>8} B | {:>9.0} | {:>9.0}",
         "UE .pak (repak V11 Zstd)",
         pak_base_bytes as f64 / (1024.0 * 1024.0),
         pak_build_ms,
         pak_cold_us,
         pak_crs_inner.bytes,
-        pak_6t_iops
+        pak_6t_iops,
+        pak_maxt_iops
     );
     let _ = (vz_cold_reads, pak_crs_inner.reads);
 
